@@ -1,0 +1,403 @@
+/**
+ * 对外入口（UMD）。
+ *
+ * 脚本一加载就会自动开始工作，不需要手动调用 init：
+ *   1. 立即拦截 console / my.request，把最早的日志全部缓存下来；
+ *   2. 等宿主（如 Cocos 的 web-adapter）建好自己的上屏 canvas 之后，再创建离屏画布
+ *      挂出可拖拽悬浮按钮，避免抢占“第一个 canvas 即上屏画布”的名额。
+ *
+ * 想手动控制：
+ *   LogPanel.init({ maxLogs: 500 });                 // 可重复调用，用于补充配置
+ *   LogPanel.setMaxLogs(200)                         // 运行时改条数上限
+ *   LogPanel.addIgnoreKeywords(['xxx'])              // 追加排除词（命中不入库、不占上限）
+ *   LogPanel.setIncludeKeywords(['yyy'])             // 只保留含 yyy 的日志（同样不占上限）
+ *   LogPanel.show() / hide() / toggle() / clear() / destroy()
+ * 想关掉自动初始化，请在加载本文件之前设置：
+ *   globalThis.__LOG_PANEL_AUTO_INIT__ = false
+ */
+import { bindResize, bindTouch, createOverlayCanvas, getMyApi, getScreenSize, resizeCanvas } from './env';
+import { LogStore, interceptConsole } from './console';
+import type { ConsolePatch } from './console';
+import { LogPanelView } from './ui';
+import { createPresenter } from './presenter';
+import type { Presenter } from './presenter';
+import { interceptNetwork, NetStore } from './network';
+import type { NetRecord, NetworkPatch } from './network';
+
+export interface LogPanelOptions {
+  /** 最多保留多少条日志，超出丢弃最旧的，默认 300 */
+  maxLogs?: number;
+  /** 最多保留多少条网络记录，默认 100 */
+  maxNetRecords?: number;
+  /** 承载面板的 canvas（宿主只允许一个 canvas 上屏时，可传入自己可用的 canvas） */
+  canvas?: any;
+  /** 是否拦截 console.log/info/warn/error/debug，默认 true */
+  intercept?: boolean;
+  /** 是否拦截 my.request 并记录 method/url/耗时/响应，默认 true */
+  interceptNetwork?: boolean;
+  /** 悬浮按钮半径，默认 22 */
+  buttonRadius?: number;
+  /** 悬浮按钮初始位置（屏幕坐标，原点左上角） */
+  buttonPosition?: { x?: number; y?: number };
+  /** 面板打开后再挂载界面（默认 false，会自动打开） */
+  open?: boolean;
+  /**
+   * 面板画布的像素比上限，默认 2。
+   * 画布是按 dpr 放的，3 倍屏上一帧就要上传约 10MB 纹理；
+   * 封到 2 能省掉一半左右的绘制与上传开销，文字略微不如原生锐利。
+   * 传 0 表示不限制（按设备原生 dpr 绘制）。
+   */
+  maxPixelRatio?: number;
+  /**
+   * 追加排除词：命中的日志整条丢弃，不格式化、不入库、也不占 maxLogs 的名额，
+   * 控制台照常输出。内置已排除 window.dispatchEvent / getStorageInfoSync。
+   */
+  ignoreKeywords?: string[];
+  /**
+   * 筛选词：非空时只保留命中的日志，未命中的同样不占 maxLogs 名额。
+   * 与 ignoreKeywords 同时配置时排除优先。
+   */
+  includeKeywords?: string[];
+}
+
+export interface LogPanelApi {
+  /** 产物版本号，构建时从 package.json 注入 */
+  readonly version: string;
+  init(options?: LogPanelOptions): LogPanelApi;
+  show(): void;
+  hide(): void;
+  toggle(): void;
+  clear(): void;
+  isOpen(): boolean;
+  /** 取当前网络记录快照（只读，供业务侧上报 / 排查） */
+  net(): NetRecord[];
+  /** 运行时调整日志条数上限，超出部分立即丢弃最旧的 */
+  setMaxLogs(maxLogs: number): void;
+  /** 运行时调整网络记录条数上限 */
+  setMaxNetRecords(maxRecords: number): void;
+  /** 追加排除词（被排除的日志不占条数上限） */
+  addIgnoreKeywords(words: string[]): void;
+  /** 整体替换排除词，传空数组表示不再排除（内置的也会被清掉） */
+  setIgnoreKeywords(words: string[]): void;
+  /** 当前生效的排除词 */
+  ignoreKeywords(): string[];
+  /** 追加筛选词：配置后只保留命中的日志 */
+  addIncludeKeywords(words: string[]): void;
+  /** 整体替换筛选词，传空数组表示不筛选 */
+  setIncludeKeywords(words: string[]): void;
+  /** 当前生效的筛选词 */
+  includeKeywords(): string[];
+  destroy(): void;
+}
+
+/** 等待宿主上屏 canvas 的最长时间：超过就认为没有引擎占位，自己直接建 canvas */
+const HOST_WAIT_TIMEOUT = 1000;
+const HOST_POLL_INTERVAL = 50;
+/** 面板画布默认的像素比上限，见 LogPanelOptions.maxPixelRatio */
+const DEFAULT_MAX_PIXEL_RATIO = 2;
+
+/** 构建时由 rollup 从 package.json 注入，运行时可以通过 LogPanel.version 读到 */
+const VERSION = '__LOG_PANEL_VERSION__';
+
+let store: LogStore | null = null;
+let netStore: NetStore | null = null;
+let view: LogPanelView | null = null;
+let presenter: Presenter | null = null;
+let consolePatch: ConsolePatch | null = null;
+let networkPatch: NetworkPatch | null = null;
+let unbindTouch: (() => void) | null = null;
+let unbindResize: (() => void) | null = null;
+let offStoreChange: (() => void) | null = null;
+let offNetChange: (() => void) | null = null;
+
+let started = false;
+let attachTimer: any = null;
+let pendingOptions: LogPanelOptions = {};
+
+function mergeOptions(target: LogPanelOptions, source: LogPanelOptions): LogPanelOptions {
+  const merged: LogPanelOptions = { ...target };
+  const keys = Object.keys(source) as Array<keyof LogPanelOptions>;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (source[key] !== undefined) (merged as any)[key] = source[key];
+  }
+  return merged;
+}
+
+/** 宿主已经建好的上屏 canvas（Cocos 的 web-adapter 会挂在 window/GameGlobal 上） */
+function hostCanvas(): any {
+  const g: any = globalThis as any;
+  return g.canvas || (g.window && g.window.canvas) || (g.GameGlobal && g.GameGlobal.canvas) || null;
+}
+
+/**
+ * 立即开始拦截，但不碰 canvas。
+ * 这样 game.js 最开头加载本文件时，引擎初始化、SDK、资源加载的日志都能抓到。
+ */
+function startIntercept(): void {
+  if (started) return;
+  started = true;
+
+  const opts = pendingOptions;
+  const logs = new LogStore(opts.maxLogs && opts.maxLogs > 0 ? opts.maxLogs : 300);
+  const net = new NetStore(opts.maxNetRecords && opts.maxNetRecords > 0 ? opts.maxNetRecords : 100);
+  if (opts.ignoreKeywords && opts.ignoreKeywords.length) logs.addIgnoreKeywords(opts.ignoreKeywords);
+  if (opts.includeKeywords && opts.includeKeywords.length) logs.addIncludeKeywords(opts.includeKeywords);
+  store = logs;
+  netStore = net;
+
+  if (opts.intercept !== false) {
+    consolePatch = interceptConsole(logs);
+  }
+  if (opts.interceptNetwork !== false) {
+    networkPatch = interceptNetwork(logs, net);
+  }
+}
+
+function clearAttachTimer(): void {
+  const g: any = globalThis as any;
+  if (attachTimer !== null) {
+    if (typeof g.clearTimeout === 'function') g.clearTimeout(attachTimer);
+    attachTimer = null;
+  }
+}
+
+/** 真正创建画布、挂出按钮。之前缓存的日志会在首帧一次性画出来 */
+function attachView(): void {
+  clearAttachTimer();
+  if (view || !store || !netStore) return;
+
+  const logs = store;
+  const net = netStore;
+  const opts = pendingOptions;
+
+  const canvas = opts.canvas || createOverlayCanvas();
+  if (!canvas) {
+    logs.push('error', '[log-panel] 创建 canvas 失败，无法显示日志面板');
+    return;
+  }
+
+  const size = getScreenSize(opts.maxPixelRatio === undefined ? DEFAULT_MAX_PIXEL_RATIO : opts.maxPixelRatio);
+  resizeCanvas(canvas, size);
+
+  // 小游戏里第一个 canvas 通常被引擎占用，这里建一条“离屏 2D → 屏幕”的通道
+  const screen = createPresenter(size);
+  presenter = screen;
+
+  const panelView = new LogPanelView(logs, net, canvas, size, {
+    version: VERSION,
+    buttonRadius: opts.buttonRadius,
+    buttonPosition: opts.buttonPosition,
+    onFrame: screen ? () => screen.present(canvas) : undefined,
+    onOpenChange: screen ? (open) => screen.setBlocking(open) : undefined,
+  });
+  view = panelView;
+
+  if (!panelView.ready) {
+    logs.push('error', '[log-panel] canvas 取不到 2d 上下文（可能已被游戏引擎作为 WebGL 使用），请通过 init({ canvas }) 传入独立 canvas');
+    return;
+  }
+
+  if (screen) screen.onReady = () => panelView.invalidate();
+
+  offStoreChange = logs.onChange(() => panelView.addLog());
+  offNetChange = net.onChange(() => panelView.addLog());
+  unbindTouch = bindTouch(canvas, (x, y, phase) => panelView.handleTouch(x, y, phase));
+  unbindResize = bindResize(() => {
+    const next = getScreenSize(opts.maxPixelRatio === undefined ? DEFAULT_MAX_PIXEL_RATIO : opts.maxPixelRatio);
+    if (screen) screen.resize(canvas, next);
+    panelView.resize(next);
+  });
+
+  panelView.render();
+  if (opts.open) panelView.show();
+}
+
+/**
+ * 决定什么时候可以安全地建 canvas：
+ * - 浏览器 / 有 DOM：直接建，不会跟引擎抢
+ * - 小游戏：先等一个宏任务，看宿主（Cocos 的 web-adapter 等）有没有先把上屏 canvas 建好；
+ *   有就马上挂载，没有且也没有适配层痕迹，就当作纯小游戏自己建
+ */
+function scheduleAttach(): void {
+  if (attachTimer !== null || view) return;
+  if (pendingOptions.canvas) {
+    attachView();
+    return;
+  }
+
+  const my = getMyApi();
+  if (!my || typeof my.createCanvas !== 'function') {
+    attachView();
+    return;
+  }
+
+  const g: any = globalThis as any;
+  const begin = Date.now();
+  let firstTick = true;
+
+  const tick = () => {
+    attachTimer = null;
+    if (view) return;
+
+    if (hostCanvas()) {
+      attachView();
+      return;
+    }
+
+    // 已经跑过一轮宏任务：既没有宿主 canvas，也没有适配层的 document，
+    // 说明这个环境里没人占第一个 canvas，可以自己建
+    if (!firstTick && !g.document) {
+      attachView();
+      return;
+    }
+
+    if (!firstTick && Date.now() - begin >= HOST_WAIT_TIMEOUT) {
+      attachView();
+      return;
+    }
+
+    firstTick = false;
+    attachTimer = typeof g.setTimeout === 'function' ? g.setTimeout(tick, HOST_POLL_INTERVAL) : null;
+    if (attachTimer === null) attachView();
+  };
+
+  attachTimer = typeof g.setTimeout === 'function' ? g.setTimeout(tick, 0) : null;
+  if (attachTimer === null) attachView();
+}
+
+function init(options?: LogPanelOptions): LogPanelApi {
+  const opts = options || {};
+  pendingOptions = mergeOptions(pendingOptions, opts);
+
+  if (!started) {
+    startIntercept();
+  } else if (store) {
+    // 已经自动初始化过，这里只补充配置
+    if (opts.maxLogs && opts.maxLogs > 0) store.setMaxLogs(opts.maxLogs);
+    if (opts.maxNetRecords && opts.maxNetRecords > 0 && netStore) netStore.setMaxRecords(opts.maxNetRecords);
+    if (opts.ignoreKeywords && opts.ignoreKeywords.length) store.addIgnoreKeywords(opts.ignoreKeywords);
+    if (opts.includeKeywords && opts.includeKeywords.length) store.addIncludeKeywords(opts.includeKeywords);
+  }
+
+  if (view) {
+    if (opts.open) view.show();
+    return api;
+  }
+
+  // 显式给了 canvas 就不用等宿主
+  if (opts.canvas) attachView();
+  else scheduleAttach();
+
+  return api;
+}
+
+function destroy(): void {
+  clearAttachTimer();
+  if (offStoreChange) {
+    offStoreChange();
+    offStoreChange = null;
+  }
+  if (offNetChange) {
+    offNetChange();
+    offNetChange = null;
+  }
+  if (unbindTouch) {
+    unbindTouch();
+    unbindTouch = null;
+  }
+  if (unbindResize) {
+    unbindResize();
+    unbindResize = null;
+  }
+  if (consolePatch) {
+    consolePatch.restore();
+    consolePatch = null;
+  }
+  if (networkPatch) {
+    networkPatch.restore();
+    networkPatch = null;
+  }
+  if (presenter) {
+    presenter.destroy();
+    presenter = null;
+  }
+  if (view) {
+    view.destroy();
+    view = null;
+  }
+  store = null;
+  netStore = null;
+  started = false;
+}
+
+const api: LogPanelApi = {
+  version: VERSION,
+  init,
+  show() {
+    if (view) view.show();
+  },
+  hide() {
+    if (view) view.hide();
+  },
+  toggle() {
+    if (view) view.toggle();
+  },
+  clear() {
+    if (store) store.clear();
+    if (netStore) netStore.clear();
+  },
+  isOpen() {
+    return !!view && view.isOpen();
+  },
+  net() {
+    return netStore ? netStore.list().slice() : [];
+  },
+  setMaxLogs(maxLogs: number) {
+    if (store) store.setMaxLogs(maxLogs);
+  },
+  setMaxNetRecords(maxRecords: number) {
+    if (netStore) netStore.setMaxRecords(maxRecords);
+  },
+  addIgnoreKeywords(words: string[]) {
+    if (store) store.addIgnoreKeywords(words || []);
+  },
+  setIgnoreKeywords(words: string[]) {
+    if (store) store.setIgnoreKeywords(words || []);
+  },
+  ignoreKeywords() {
+    return store ? store.ignoreKeywords() : [];
+  },
+  addIncludeKeywords(words: string[]) {
+    if (store) store.addIncludeKeywords(words || []);
+  },
+  setIncludeKeywords(words: string[]) {
+    if (store) store.setIncludeKeywords(words || []);
+  },
+  includeKeywords() {
+    return store ? store.includeKeywords() : [];
+  },
+  destroy,
+};
+
+// 无论宿主用 require 还是直接加载，都保证能通过 globalThis.LogPanel 访问
+const globalScope: any = typeof globalThis !== 'undefined' ? globalThis : undefined;
+// 同一份脚本可能被加载两次（game.js 里手动 require + 引擎插件列表各加载一次），
+// 这时直接复用第一份实例，避免 console 被重复包装导致日志翻倍
+const existing: LogPanelApi | null = globalScope && globalScope.__LOG_PANEL_API__ ? globalScope.__LOG_PANEL_API__ : null;
+
+if (globalScope && !existing) {
+  globalScope.__LOG_PANEL_API__ = api;
+  globalScope.LogPanel = api;
+}
+
+// 默认自动初始化：加载即开始拦截，UI 等宿主就绪后再挂载
+if (!existing && globalScope && globalScope.__LOG_PANEL_AUTO_INIT__ !== false) {
+  try {
+    init();
+  } catch (e) {
+    // 自动初始化失败不能影响游戏启动
+  }
+}
+
+export default existing || api;
