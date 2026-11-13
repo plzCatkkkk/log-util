@@ -154,6 +154,8 @@ export class NetStore {
   private pendingCount = 0;
 
   maxRecords: number;
+  /** 内容版本号，UI 靠它判断这一帧是否和上一帧一样、能否直接跳过重绘 */
+  version = 0;
 
   constructor(maxRecords: number) {
     this.maxRecords = maxRecords;
@@ -252,6 +254,7 @@ export class NetStore {
   }
 
   private emit(): void {
+    this.version++;
     for (let i = 0; i < this.listeners.length; i++) {
       try {
         this.listeners[i]();

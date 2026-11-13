@@ -294,6 +294,59 @@ export function bindResize(callback: () => void): () => void {
   };
 }
 
+/**
+ * 按 key 读本地存储（小游戏 my.getStorageSync，浏览器 localStorage）。
+ * 只做单点读写，故意不碰 localStorage.length：web-adapter 里那个 getter 每次都会
+ * 调 my.getStorageInfoSync 并序列化全部数据，是面板卡顿的主要来源。
+ * 读不到或出错都返回空串，由调用方决定兜底。
+ */
+export function readStorage(key: string): string {
+  const my = getMyApi();
+  if (my && typeof my.getStorageSync === 'function') {
+    try {
+      const res = my.getStorageSync({ key });
+      const data = res && res.data;
+      if (data === undefined || data === null) return '';
+      return typeof data === 'string' ? data : JSON.stringify(data);
+    } catch (e) {
+      // 落回 localStorage
+    }
+  }
+
+  const g: any = globalThis as any;
+  try {
+    const ls = g.localStorage;
+    if (ls && typeof ls.getItem === 'function') {
+      const value = ls.getItem(key);
+      return value === undefined || value === null ? '' : String(value);
+    }
+  } catch (e) {
+    // ignore
+  }
+  return '';
+}
+
+/** 按 key 写本地存储，失败静默（调试面板不能因为存储问题影响游戏） */
+export function writeStorage(key: string, value: string): void {
+  const my = getMyApi();
+  if (my && typeof my.setStorageSync === 'function') {
+    try {
+      my.setStorageSync({ key, data: value });
+      return;
+    } catch (e) {
+      // 落回 localStorage
+    }
+  }
+
+  const g: any = globalThis as any;
+  try {
+    const ls = g.localStorage;
+    if (ls && typeof ls.setItem === 'function') ls.setItem(key, value);
+  } catch (e) {
+    // ignore
+  }
+}
+
 export interface NetworkState {
   /** 是否联网 */
   online: boolean;

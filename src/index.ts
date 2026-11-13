@@ -7,15 +7,16 @@
  *      挂出可拖拽悬浮按钮，避免抢占“第一个 canvas 即上屏画布”的名额。
  *
  * 想手动控制：
- *   LogPanel.init({ maxLogs: 500 });                 // 可重复调用，用于补充配置
- *   LogPanel.setMaxLogs(200)                         // 运行时改条数上限
+ *   LogPanel.init({ maxLogs: 1000, displayLimit: 300 });  // 可重复调用，用于补充配置
+ *   LogPanel.setMaxLogs(500)                         // 运行时改内存条数上限
+ *   LogPanel.setDisplayLimit(300)                    // 运行时改渲染条数
  *   LogPanel.addIgnoreKeywords(['xxx'])              // 追加排除词（命中不入库、不占上限）
- *   LogPanel.setIncludeKeywords(['yyy'])             // 只保留含 yyy 的日志（同样不占上限）
+ *   LogPanel.setIncludeKeywords(['yyy'])             // 只显示含 yyy 的日志（含已存历史）
  *   LogPanel.show() / hide() / toggle() / clear() / destroy()
  * 想关掉自动初始化，请在加载本文件之前设置：
  *   globalThis.__LOG_PANEL_AUTO_INIT__ = false
  */
-import { bindResize, bindTouch, createOverlayCanvas, getMyApi, getScreenSize, resizeCanvas } from './env';
+import { bindResize, bindTouch, createOverlayCanvas, getMyApi, getScreenSize, readStorage, resizeCanvas, writeStorage } from './env';
 import { LogStore, interceptConsole } from './console';
 import type { ConsolePatch } from './console';
 import { LogPanelView } from './ui';
@@ -25,8 +26,13 @@ import { interceptNetwork, NetStore } from './network';
 import type { NetRecord, NetworkPatch } from './network';
 
 export interface LogPanelOptions {
-  /** 最多保留多少条日志，超出丢弃最旧的，默认 300 */
+  /** 内存里最多保留多少条日志，超出丢弃最旧的，默认 1000 */
   maxLogs?: number;
+  /**
+   * 面板最多往回显示多少条，默认 300。
+   * 只限制渲染，不影响内存里保留的历史；配合 includeKeywords 能翻到更早的日志。
+   */
+  displayLimit?: number;
   /** 最多保留多少条网络记录，默认 100 */
   maxNetRecords?: number;
   /** 承载面板的 canvas（宿主只允许一个 canvas 上屏时，可传入自己可用的 canvas） */
@@ -51,11 +57,12 @@ export interface LogPanelOptions {
   /**
    * 追加排除词：命中的日志整条丢弃，不格式化、不入库、也不占 maxLogs 的名额，
    * 控制台照常输出。内置已排除 window.dispatchEvent / getStorageInfoSync。
+   * 面板里的增删会写进本地存储，重启后自动恢复。
    */
   ignoreKeywords?: string[];
   /**
-   * 筛选词：非空时只保留命中的日志，未命中的同样不占 maxLogs 名额。
-   * 与 ignoreKeywords 同时配置时排除优先。
+   * 筛选词：非空时只显示命中的日志。作用在展示层，内存里的历史不会被丢掉，
+   * 加一个词就能把之前存下的老日志筛出来。
    */
   includeKeywords?: string[];
 }
@@ -73,15 +80,17 @@ export interface LogPanelApi {
   net(): NetRecord[];
   /** 运行时调整日志条数上限，超出部分立即丢弃最旧的 */
   setMaxLogs(maxLogs: number): void;
+  /** 运行时调整显示条数（只影响渲染，内存里的历史不变） */
+  setDisplayLimit(limit: number): void;
   /** 运行时调整网络记录条数上限 */
   setMaxNetRecords(maxRecords: number): void;
-  /** 追加排除词（被排除的日志不占条数上限） */
+  /** 追加排除词（被排除的日志不占条数上限）；改动会写进本地存储，下次启动继续生效 */
   addIgnoreKeywords(words: string[]): void;
-  /** 整体替换排除词，传空数组表示不再排除（内置的也会被清掉） */
+  /** 整体替换排除词，传空数组表示不再排除（内置的也会被清掉）；同样持久化 */
   setIgnoreKeywords(words: string[]): void;
-  /** 当前生效的排除词 */
+  /** 当前生效的排除词（含本地存下来的） */
   ignoreKeywords(): string[];
-  /** 追加筛选词：配置后只保留命中的日志 */
+  /** 追加筛选词：配置后只显示命中的日志（能筛到已存的历史） */
   addIncludeKeywords(words: string[]): void;
   /** 整体替换筛选词，传空数组表示不筛选 */
   setIncludeKeywords(words: string[]): void;
@@ -95,6 +104,34 @@ const HOST_WAIT_TIMEOUT = 1000;
 const HOST_POLL_INTERVAL = 50;
 /** 面板画布默认的像素比上限，见 LogPanelOptions.maxPixelRatio */
 const DEFAULT_MAX_PIXEL_RATIO = 2;
+/** 内存里保留的日志条数，memory 里存得多一些，方便用筛选词往回翻 */
+const DEFAULT_MAX_LOGS = 1000;
+/** 面板一次最多渲染多少条 */
+const DEFAULT_DISPLAY_LIMIT = 300;
+/** 排除词存在本地存储里的 key，重启后自动读回来 */
+const IGNORE_STORAGE_KEY = '__LOG_PANEL_IGNORE_KEYWORDS__';
+
+/** 读本地存过的排除词；null 表示从没存过（用内置默认词） */
+function loadIgnoreKeywords(): string[] | null {
+  const raw = readStorage(IGNORE_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) return null;
+    const words: string[] = [];
+    for (let i = 0; i < data.length; i++) {
+      if (typeof data[i] === 'string' && data[i]) words.push(data[i]);
+    }
+    // 空数组也要认：用户把词全删了，下次启动就该保持不排除
+    return words;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveIgnoreKeywords(words: string[]): void {
+  writeStorage(IGNORE_STORAGE_KEY, JSON.stringify(words || []));
+}
 
 /** 构建时由 rollup 从 package.json 注入，运行时可以通过 LogPanel.version 读到 */
 const VERSION = '__LOG_PANEL_VERSION__';
@@ -139,9 +176,16 @@ function startIntercept(): void {
   started = true;
 
   const opts = pendingOptions;
-  const logs = new LogStore(opts.maxLogs && opts.maxLogs > 0 ? opts.maxLogs : 300);
+  const logs = new LogStore(opts.maxLogs && opts.maxLogs > 0 ? opts.maxLogs : DEFAULT_MAX_LOGS);
+  logs.displayLimit = opts.displayLimit && opts.displayLimit > 0 ? Math.floor(opts.displayLimit) : DEFAULT_DISPLAY_LIMIT;
   const net = new NetStore(opts.maxNetRecords && opts.maxNetRecords > 0 ? opts.maxNetRecords : 100);
+  // 本地存的排除词优先恢复，这样引擎启动阶段最早的日志就能被过滤掉；
+  // 代码里配置的排除词每次都重新叠加，不会被本地记录冲掉
+  const savedKeywords = loadIgnoreKeywords();
+  if (savedKeywords) logs.setIgnoreKeywords(savedKeywords);
   if (opts.ignoreKeywords && opts.ignoreKeywords.length) logs.addIgnoreKeywords(opts.ignoreKeywords);
+  // 之后面板里的增删（含 init 补的配置）都写回本地，重启仍然生效
+  logs.onIgnoreKeywordsChange = saveIgnoreKeywords;
   if (opts.includeKeywords && opts.includeKeywords.length) logs.addIncludeKeywords(opts.includeKeywords);
   store = logs;
   netStore = net;
@@ -200,8 +244,8 @@ function attachView(): void {
 
   if (screen) screen.onReady = () => panelView.invalidate();
 
-  offStoreChange = logs.onChange(() => panelView.addLog());
-  offNetChange = net.onChange(() => panelView.addLog());
+  offStoreChange = logs.onChange(() => panelView.onStoreChange());
+  offNetChange = net.onChange(() => panelView.onNetChange());
   unbindTouch = bindTouch(canvas, (x, y, phase) => panelView.handleTouch(x, y, phase));
   unbindResize = bindResize(() => {
     const next = getScreenSize(opts.maxPixelRatio === undefined ? DEFAULT_MAX_PIXEL_RATIO : opts.maxPixelRatio);
@@ -275,6 +319,7 @@ function init(options?: LogPanelOptions): LogPanelApi {
   } else if (store) {
     // 已经自动初始化过，这里只补充配置
     if (opts.maxLogs && opts.maxLogs > 0) store.setMaxLogs(opts.maxLogs);
+    if (opts.displayLimit && opts.displayLimit > 0) store.setDisplayLimit(opts.displayLimit);
     if (opts.maxNetRecords && opts.maxNetRecords > 0 && netStore) netStore.setMaxRecords(opts.maxNetRecords);
     if (opts.ignoreKeywords && opts.ignoreKeywords.length) store.addIgnoreKeywords(opts.ignoreKeywords);
     if (opts.includeKeywords && opts.includeKeywords.length) store.addIncludeKeywords(opts.includeKeywords);
@@ -355,6 +400,9 @@ const api: LogPanelApi = {
   },
   setMaxLogs(maxLogs: number) {
     if (store) store.setMaxLogs(maxLogs);
+  },
+  setDisplayLimit(limit: number) {
+    if (store) store.setDisplayLimit(limit);
   },
   setMaxNetRecords(maxRecords: number) {
     if (netStore) netStore.setMaxRecords(maxRecords);

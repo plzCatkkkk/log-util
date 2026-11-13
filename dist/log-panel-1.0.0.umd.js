@@ -282,6 +282,61 @@
         };
     }
     /**
+     * 按 key 读本地存储（小游戏 my.getStorageSync，浏览器 localStorage）。
+     * 只做单点读写，故意不碰 localStorage.length：web-adapter 里那个 getter 每次都会
+     * 调 my.getStorageInfoSync 并序列化全部数据，是面板卡顿的主要来源。
+     * 读不到或出错都返回空串，由调用方决定兜底。
+     */
+    function readStorage(key) {
+        const my = getMyApi();
+        if (my && typeof my.getStorageSync === 'function') {
+            try {
+                const res = my.getStorageSync({ key });
+                const data = res && res.data;
+                if (data === undefined || data === null)
+                    return '';
+                return typeof data === 'string' ? data : JSON.stringify(data);
+            }
+            catch (e) {
+                // 落回 localStorage
+            }
+        }
+        const g = globalThis;
+        try {
+            const ls = g.localStorage;
+            if (ls && typeof ls.getItem === 'function') {
+                const value = ls.getItem(key);
+                return value === undefined || value === null ? '' : String(value);
+            }
+        }
+        catch (e) {
+            // ignore
+        }
+        return '';
+    }
+    /** 按 key 写本地存储，失败静默（调试面板不能因为存储问题影响游戏） */
+    function writeStorage(key, value) {
+        const my = getMyApi();
+        if (my && typeof my.setStorageSync === 'function') {
+            try {
+                my.setStorageSync({ key, data: value });
+                return;
+            }
+            catch (e) {
+                // 落回 localStorage
+            }
+        }
+        const g = globalThis;
+        try {
+            const ls = g.localStorage;
+            if (ls && typeof ls.setItem === 'function')
+                ls.setItem(key, value);
+        }
+        catch (e) {
+            // ignore
+        }
+    }
+    /**
      * 监听网络状态（在线 / 断网、网络类型变化）。
      * 小游戏用 my.getNetworkType + my.onNetworkStatusChange，浏览器退回 navigator.onLine。
      * 返回解绑函数。
@@ -740,32 +795,53 @@
             this.counts = { log: 0, info: 0, warn: 0, error: 0 };
             /** 排除词：命中的日志整条丢弃，被丢弃的不占条数上限 */
             this.keywords = DEFAULT_IGNORE_KEYWORDS.slice();
-            /** 筛选词：非空时只保留命中的日志，同样不占条数上限 */
+            /** 筛选词：非空时只显示命中的日志，作用在展示层，能翻到已存下的历史 */
             this.includeWords = [];
+            /** 面板最多往回显示多少条（按筛选后的结果从新往旧数） */
+            this.displayLimit = 300;
             /** 内容版本号，UI 靠它判断能否复用上一帧的过滤/换行结果 */
             this.version = 0;
+            /** 排除词变化后的回调（用于写本地存储），null 表示不持久化 */
+            this.onIgnoreKeywordsChange = null;
             this.maxLogs = maxLogs;
         }
         /** 整体替换过滤词，传空数组表示不再过滤任何日志 */
         setIgnoreKeywords(words) {
             this.keywords = normalizeKeywords(words || []);
+            this.notifyIgnoreKeywords();
         }
         addIgnoreKeywords(words) {
             if (!words || !words.length)
                 return;
             this.keywords = normalizeKeywords(this.keywords.concat(words));
+            this.notifyIgnoreKeywords();
+        }
+        notifyIgnoreKeywords() {
+            const handler = this.onIgnoreKeywordsChange;
+            if (!handler)
+                return;
+            try {
+                handler(this.keywords.slice());
+            }
+            catch (e) {
+                // 存不进去不影响当前会话的过滤
+            }
         }
         ignoreKeywords() {
             return this.keywords.slice();
         }
-        /** 整体替换筛选词，传空数组表示不筛选（所有未命中的排除词的日志都保留） */
+        /** 整体替换筛选词，传空数组表示不筛选；改动只影响展示，历史日志立刻跟着变 */
         setIncludeKeywords(words) {
             this.includeWords = normalizeKeywords(words || []);
+            this.version++;
+            this.emit();
         }
         addIncludeKeywords(words) {
             if (!words || !words.length)
                 return;
             this.includeWords = normalizeKeywords(this.includeWords.concat(words));
+            this.version++;
+            this.emit();
         }
         includeKeywords() {
             return this.includeWords.slice();
@@ -795,32 +871,26 @@
             }
             return false;
         }
-        /** 没有筛选词时全部通过；有筛选词时先扫原始参数 */
-        shouldInclude(args) {
+        /** 没有筛选词时全部通过；有筛选词时看已格式化文本（含时间前缀）是否命中 */
+        matchesInclude(entry) {
             const words = this.includeWords;
             if (!words.length)
                 return true;
-            for (let i = 0; i < args.length; i++) {
-                const arg = args[i];
-                if (typeof arg !== 'string' || !arg)
-                    continue;
-                for (let k = 0; k < words.length; k++) {
-                    if (arg.indexOf(words[k]) >= 0)
-                        return true;
-                }
-            }
-            return false;
-        }
-        /** 筛选词也可能只出现在对象字段里，格式化结果再兜一次 */
-        isIncludedText(text) {
-            const words = this.includeWords;
-            if (!words.length)
-                return true;
+            const text = entry.text;
             for (let k = 0; k < words.length; k++) {
                 if (text.indexOf(words[k]) >= 0)
                     return true;
             }
             return false;
+        }
+        /** 运行时调整显示条数（只影响渲染，不影响内存里保留的历史） */
+        setDisplayLimit(limit) {
+            const next = limit > 0 ? Math.floor(limit) : 0;
+            if (next === this.displayLimit)
+                return;
+            this.displayLimit = next;
+            this.version++;
+            this.emit();
         }
         /** 运行时调整上限，超出部分立即丢弃最旧的 */
         setMaxLogs(maxLogs) {
@@ -917,11 +987,10 @@
                 if (!store.shouldIgnore(args)) {
                     try {
                         const formatted = formatConsoleArgs(args);
-                        // 排除优先：先看格式化文本是否命中排除词，再看是否命中筛选词
-                        const keep = !store.isIgnoredText(formatted.text)
-                            && (store.shouldInclude(args) || store.isIncludedText(formatted.text));
-                        if (keep)
+                        // 只判排除词；筛选词在展示层生效，这样能翻到筛选之前已经存下的历史
+                        if (!store.isIgnoredText(formatted.text)) {
                             store.push(item.level, formatted.text, formatted.runs);
+                        }
                     }
                     catch (e) {
                         // 格式化失败也要保证原始日志照常输出
@@ -959,6 +1028,10 @@
     const LINE_HEIGHT = 17;
     const ROW_GAP = 6;
     const MAX_LINES_PER_ENTRY = 40;
+    /** 收起状态下每条日志最多显示几行，点开才展开到 MAX_LINES_PER_ENTRY */
+    const COLLAPSED_LINES = 4;
+    /** 可展开的行在正文下面留出的「展开全文」提示带高度 */
+    const EXPAND_HINT_H = 15;
     /** 网络卡片：行高、卡片间距、上下内边距 */
     const NET_LINE_HEIGHT = 15;
     const NET_CARD_GAP = 8;
@@ -968,6 +1041,15 @@
     const MAX_DETAIL_LINES = 80;
     /** 有请求进行中时的实时刷新间隔 */
     const NET_TICK_INTERVAL = 400;
+    /**
+     * 日志密集写入时两帧之间至少隔这么久。
+     * 触摸交互走 requestAnimationFrame 保持跟手，只有日志驱动的重绘才限速。
+     */
+    const LOG_FRAME_GAP = 50;
+    /** 筛选弹窗每段最多列出多少个词，超出的给一行提示 */
+    const DIALOG_MAX_WORDS = 6;
+    /** 筛选弹窗里一行关键词的高度 */
+    const DIALOG_ROW_H = 26;
     const COLORS = {
         maskBg: 'rgba(0, 0, 0, 0.38)',
         panelBg: 'rgba(22, 23, 27, 0.96)',
@@ -1055,6 +1137,12 @@
             this.netHits = [];
             /** 按下时落在哪张网络卡片上，抬手没滑动就切换展开 */
             this.pendingCardId = null;
+            /** 内容超过收起行数、被手动展开的日志 id（只记少数几条） */
+            this.expandedLogIds = [];
+            /** 上一帧渲染出来的日志行命中区 */
+            this.rowHits = [];
+            /** 按下时落在哪条日志上，抬手没滑动就切换展开 */
+            this.pendingRowId = null;
             this.netState = { online: true, type: 'unknown' };
             this.netStateTimer = null;
             this.tickTimer = null;
@@ -1062,6 +1150,17 @@
             this.layoutCache = null;
             this.layoutKey = '';
             this.listCache = null;
+            /** 上一帧的状态快照，相同就跳过重画 */
+            this.frameKey = '';
+            /** 上一帧绘制时刻，用于日志驱动的重绘限速 */
+            this.lastRenderAt = 0;
+            /** 限速等待中的定时器；交互来了可以提前取消 */
+            this.throttleTimer = null;
+            /** 筛选词弹窗，null 表示未打开 */
+            this.filterDialog = null;
+            /** 弹窗底部的一行提示（比如当前环境不支持输入） */
+            this.dialogTip = '';
+            this.dialogTipTimer = null;
             this.layout = null;
             this.touchMode = 'none';
             this.touchStart = { x: 0, y: 0 };
@@ -1118,6 +1217,9 @@
                 return;
             this.visible = false;
             this.touchMode = 'none';
+            this.filterDialog = null;
+            this.dialogTip = '';
+            this.clearDialogTipTimer();
             if (this.onOpenChange)
                 this.onOpenChange(false);
             this.invalidate();
@@ -1128,13 +1230,55 @@
             else
                 this.show();
         }
-        addLog() {
-            if (this.visible)
-                this.invalidate();
+        /** console 日志变化：net tab 里不显示日志内容，不用重画 */
+        onStoreChange() {
+            if (!this.visible || this.filter === 'net')
+                return;
+            this.invalidateThrottled();
         }
-        invalidate() {
+        /** 网络记录变化：只有 net tab 会用到 */
+        onNetChange() {
+            if (!this.visible || this.filter !== 'net')
+                return;
+            this.invalidateThrottled();
+        }
+        /**
+         * 数据变化触发的重绘：日志成批刷屏时限制到 LOG_FRAME_GAP 一帧，
+         * 避免每条日志都带来一次全屏纹理上传。
+         */
+        invalidateThrottled() {
             if (this.pending)
                 return;
+            const now = Date.now();
+            const wait = LOG_FRAME_GAP - (now - this.lastRenderAt);
+            if (wait <= 0) {
+                this.invalidate();
+                return;
+            }
+            this.pending = true;
+            const g = globalThis;
+            if (typeof g.setTimeout !== 'function') {
+                this.pending = false;
+                this.invalidate();
+                return;
+            }
+            this.throttleTimer = g.setTimeout(() => {
+                this.throttleTimer = null;
+                this.pending = false;
+                this.render();
+            }, wait);
+        }
+        invalidate() {
+            if (this.pending) {
+                // 交互触发的重绘要跟手：把限速中的等待提前到下一帧
+                if (this.throttleTimer === null)
+                    return;
+                const g = globalThis;
+                if (typeof g.clearTimeout === 'function')
+                    g.clearTimeout(this.throttleTimer);
+                this.throttleTimer = null;
+                this.pending = false;
+            }
             this.pending = true;
             const g = globalThis;
             if (typeof g.requestAnimationFrame === 'function') {
@@ -1158,6 +1302,12 @@
             const ctx = this.ctx;
             if (!ctx)
                 return;
+            // 内容和上一帧完全一样就直接跳过：一次重画 = 一次清屏 + 一次全屏纹理上传
+            const key = this.frameKeyOf();
+            if (key === this.frameKey)
+                return;
+            this.frameKey = key;
+            this.lastRenderAt = Date.now();
             const dpr = this.size.pixelRatio || 1;
             if (typeof ctx.setTransform === 'function')
                 ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1166,6 +1316,10 @@
                 this.renderPanel();
             else
                 this.renderButton();
+            if (this.visible && this.filterDialog)
+                this.renderFilterDialog();
+            // 滚动位置在绘制里可能被夹紧，按夹紧后的状态记录，避免下一帧白画一次
+            this.frameKey = this.frameKeyOf();
             if (this.onFrame) {
                 try {
                     this.onFrame();
@@ -1174,6 +1328,42 @@
                     // 上屏失败不能影响绘制
                 }
             }
+        }
+        /** 决定这一帧画面内容的状态快照；相同就说明重画没有意义 */
+        frameKeyOf() {
+            let key = (this.visible ? '1' : '0') +
+                '|' + this.filter +
+                '|' + this.scroll +
+                '|' + this.store.version +
+                '|' + (this.netState.online ? '1' : '0') + this.netState.type +
+                '|' + this.size.width + 'x' + this.size.height + '@' + this.size.pixelRatio;
+            if (this.visible) {
+                // net tab 的内容全在 NetStore 里；console tab 不依赖它
+                if (this.filter === 'net') {
+                    key += '|' + this.net.version + ':' + this.net.total();
+                    // 有请求在跑时耗时是实时跳的，按 tick 周期变化让去重放行
+                    if (this.net.pending() > 0)
+                        key += '|t' + Math.floor(Date.now() / NET_TICK_INTERVAL);
+                }
+                key += '|' + (this.expandedNetId === null ? '' : this.expandedNetId);
+                // 日志行的展开状态会影响行高和内容，必须进签名
+                if (this.expandedLogIds.length)
+                    key += '|e' + this.expandedLogIds.join(',');
+                if (this.filterDialog) {
+                    key +=
+                        '|d' +
+                            this.filterDialog.include.join(',') +
+                            ';' +
+                            this.filterDialog.ignore.join(',') +
+                            ';' +
+                            this.dialogTip;
+                }
+            }
+            else {
+                // 收起态只画悬浮按钮，位置变了才需要重画
+                key += '|' + this.button.x + ',' + this.button.y + ',' + this.button.r;
+            }
+            return key;
         }
         /** 触摸分发，返回 true 表示面板消费了这一次触摸 */
         handleTouch(x, y, phase) {
@@ -1190,6 +1380,12 @@
                 const layout = this.layout;
                 if (!layout)
                     return false;
+                // 筛选词弹窗在最上层：打开时所有触摸都归它，点弹窗外即关闭
+                if (this.filterDialog) {
+                    this.touchMode = 'consumed';
+                    this.handleDialogTouch(x, y);
+                    return true;
+                }
                 // 点在面板外的遮罩上（上方留白区域）：直接收起
                 if (!insideRect(layout.panel, x, y)) {
                     this.hide();
@@ -1201,10 +1397,16 @@
                     this.touchMode = 'consumed';
                     return true;
                 }
+                if (insideRect(layout.filterBtn, x, y)) {
+                    this.openFilterDialog();
+                    this.touchMode = 'consumed';
+                    return true;
+                }
                 if (insideRect(layout.clear, x, y)) {
                     this.store.clear();
                     this.net.clear();
                     this.expandedNetId = null;
+                    this.expandedLogIds.length = 0;
                     this.touchMode = 'consumed';
                     return true;
                 }
@@ -1218,8 +1420,15 @@
                 if (insideRect(layout.list, x, y)) {
                     this.touchMode = 'scroll';
                     this.scrollStart = this.scroll;
-                    // 网络 tab 里按下落在某张卡片上：抬手时若没滑动就展开/收起详情
-                    this.pendingCardId = this.filter === 'net' ? this.hitNetCard(x, y) : null;
+                    // 按下落在某张网络卡片 / 某条日志上：抬手时若没滑动就展开/收起
+                    if (this.filter === 'net') {
+                        this.pendingCardId = this.hitNetCard(x, y);
+                        this.pendingRowId = null;
+                    }
+                    else {
+                        this.pendingCardId = null;
+                        this.pendingRowId = this.hitLogRow(x, y);
+                    }
                     return true;
                 }
                 // 面板空白区域也吃掉，避免误触到下面的游戏
@@ -1253,11 +1462,16 @@
                 if (this.touchMode === 'scroll') {
                     const moved = Math.abs(x - this.touchStart.x) + Math.abs(y - this.touchStart.y);
                     const cardId = this.pendingCardId;
+                    const rowId = this.pendingRowId;
                     this.pendingCardId = null;
+                    this.pendingRowId = null;
                     if (moved < 8 && cardId !== null) {
                         this.expandedNetId = this.expandedNetId === cardId ? null : cardId;
                         this.scroll = clamp(this.scroll, 0, this.maxScroll);
                         this.invalidate();
+                    }
+                    else if (moved < 8 && rowId !== null) {
+                        this.toggleLogRow(rowId);
                     }
                 }
                 this.touchMode = 'none';
@@ -1272,11 +1486,283 @@
             }
             return null;
         }
+        /** 只把内容确实超过收起行数的行算作可点头的区域 */
+        hitLogRow(x, y) {
+            for (let i = this.rowHits.length - 1; i >= 0; i--) {
+                const hit = this.rowHits[i];
+                if (hit.expandable && insideRect(hit.rect, x, y))
+                    return hit.id;
+            }
+            return null;
+        }
+        /** 切换一条日志的展开状态；展开后仍受 MAX_LINES_PER_ENTRY 行数上限约束 */
+        toggleLogRow(id) {
+            const index = this.expandedLogIds.indexOf(id);
+            if (index >= 0) {
+                this.expandedLogIds.splice(index, 1);
+            }
+            else {
+                this.expandedLogIds.push(id);
+                // 展开的内容可能很长，把上限收紧一点，防止无限攒
+                if (this.expandedLogIds.length > 20)
+                    this.expandedLogIds.shift();
+            }
+            // 展开会让内容变高，滚动位置跟着夹紧到新的范围
+            this.scroll = clamp(this.scroll, 0, this.maxScroll);
+            this.invalidate();
+        }
         setFilter(level) {
             this.filter = level;
             this.scroll = 0;
             this.pendingCardId = null;
+            this.pendingRowId = null;
             this.invalidate();
+        }
+        /** 打开筛选词弹窗：把 store 里当前生效的筛选词/排除词取一份快照来编辑 */
+        openFilterDialog() {
+            this.filterDialog = {
+                include: this.store.includeKeywords(),
+                ignore: this.store.ignoreKeywords(),
+            };
+            this.dialogTip = '';
+            this.clearDialogTipTimer();
+            this.invalidate();
+        }
+        closeFilterDialog() {
+            this.filterDialog = null;
+            this.dialogTip = '';
+            this.clearDialogTipTimer();
+            this.invalidate();
+        }
+        /** 弹窗里的增删立即回写 store；注意只影响之后的新日志，历史日志需要清空 */
+        applyDialogKeywords() {
+            const dialog = this.filterDialog;
+            if (!dialog)
+                return;
+            this.store.setIncludeKeywords(dialog.include);
+            this.store.setIgnoreKeywords(dialog.ignore);
+            this.invalidate();
+        }
+        removeKeyword(kind, index) {
+            const dialog = this.filterDialog;
+            if (!dialog)
+                return;
+            const words = kind === 'include' ? dialog.include : dialog.ignore;
+            if (index < 0 || index >= words.length)
+                return;
+            words.splice(index, 1);
+            this.applyDialogKeywords();
+        }
+        /** 新增关键词：小游戏里没有 DOM 输入框，走宿主的 my.prompt */
+        promptAddKeyword(kind) {
+            const dialog = this.filterDialog;
+            if (!dialog)
+                return;
+            const my = getMyApi();
+            if (!my || typeof my.prompt !== 'function') {
+                this.setDialogTip('当前环境不支持输入，请用 LogPanel.addIncludeKeywords() 配置');
+                return;
+            }
+            my.prompt({
+                title: kind === 'include' ? '添加筛选词' : '添加排除词',
+                message: kind === 'include' ? '只显示包含该词的日志（含已存历史）' : '包含该词的日志整条丢弃',
+                placeholder: '例如 [BATTLE]',
+                success: (res) => {
+                    // 输入期间弹窗被关掉就丢弃这次输入
+                    if (this.filterDialog !== dialog)
+                        return;
+                    if (!res || !res.ok)
+                        return;
+                    const word = String(res.inputValue === undefined ? '' : res.inputValue).trim();
+                    if (!word)
+                        return;
+                    const target = kind === 'include' ? dialog.include : dialog.ignore;
+                    const other = kind === 'include' ? dialog.ignore : dialog.include;
+                    // 同一个词不能既筛又排，出现在另一段里就先挪过来
+                    const otherIndex = other.indexOf(word);
+                    if (otherIndex >= 0)
+                        other.splice(otherIndex, 1);
+                    if (target.indexOf(word) < 0)
+                        target.push(word);
+                    this.applyDialogKeywords();
+                },
+            });
+        }
+        setDialogTip(text) {
+            this.dialogTip = text;
+            this.clearDialogTipTimer();
+            const g = globalThis;
+            if (typeof g.setTimeout === 'function') {
+                this.dialogTipTimer = g.setTimeout(() => {
+                    this.dialogTipTimer = null;
+                    this.dialogTip = '';
+                    this.invalidate();
+                }, 4000);
+            }
+            this.invalidate();
+        }
+        clearDialogTipTimer() {
+            const g = globalThis;
+            if (this.dialogTipTimer !== null) {
+                if (typeof g.clearTimeout === 'function')
+                    g.clearTimeout(this.dialogTipTimer);
+                this.dialogTipTimer = null;
+            }
+        }
+        dialogRemoveRect(rowY, box) {
+            return { x: box.x + box.w - 12 - 22, y: rowY - 11, w: 22, h: 22 };
+        }
+        /** 弹窗几何：触摸与绘制共用一个纯函数，保证命中区和画出来的位置一致 */
+        getDialogLayout(dialog) {
+            const w = Math.max(220, Math.min(this.size.width - 32, 320));
+            const titleH = 36;
+            const secTitleH = 20;
+            const emptyH = 20;
+            const secGap = 8;
+            const btnH = 28;
+            const tipH = 20;
+            const rowCount = (n) => n ? Math.min(n, DIALOG_MAX_WORDS) + (n > DIALOG_MAX_WORDS ? 1 : 0) : 0;
+            const secH = (n) => secTitleH + (n ? rowCount(n) * DIALOG_ROW_H : emptyH);
+            const h = titleH +
+                secH(dialog.include.length) +
+                secGap +
+                secH(dialog.ignore.length) +
+                secGap +
+                btnH +
+                tipH +
+                10;
+            const x = Math.round((this.size.width - w) / 2);
+            const y = Math.round((this.size.height - h) / 2);
+            const box = { x, y, w, h };
+            const close = { x: x + w - 8 - 30, y: y + 4, w: 30, h: 26 };
+            const rows = [];
+            let cursor = y + titleH;
+            const includeTitleY = cursor + secTitleH / 2;
+            cursor += secTitleH;
+            const includeTop = cursor + DIALOG_ROW_H / 2;
+            const includeShown = Math.min(dialog.include.length, DIALOG_MAX_WORDS);
+            for (let i = 0; i < includeShown; i++) {
+                rows.push({ kind: 'include', index: i, word: dialog.include[i], y: includeTop + i * DIALOG_ROW_H });
+            }
+            cursor += dialog.include.length ? rowCount(dialog.include.length) * DIALOG_ROW_H : emptyH;
+            cursor += secGap;
+            const ignoreTitleY = cursor + secTitleH / 2;
+            cursor += secTitleH;
+            const ignoreTop = cursor + DIALOG_ROW_H / 2;
+            const ignoreShown = Math.min(dialog.ignore.length, DIALOG_MAX_WORDS);
+            for (let i = 0; i < ignoreShown; i++) {
+                rows.push({ kind: 'ignore', index: i, word: dialog.ignore[i], y: ignoreTop + i * DIALOG_ROW_H });
+            }
+            cursor += dialog.ignore.length ? rowCount(dialog.ignore.length) * DIALOG_ROW_H : emptyH;
+            cursor += secGap;
+            const btnW = Math.floor((w - 12 * 2 - 8) / 2);
+            const addInclude = { x: x + 12, y: cursor, w: btnW, h: btnH };
+            const addIgnore = { x: x + 12 + btnW + 8, y: cursor, w: btnW, h: btnH };
+            cursor += btnH;
+            const tipY = cursor + 12;
+            return { box, close, addInclude, addIgnore, includeTitleY, ignoreTitleY, includeTop, ignoreTop, rows, tipY };
+        }
+        handleDialogTouch(x, y) {
+            const dialog = this.filterDialog;
+            if (!dialog)
+                return;
+            const geo = this.getDialogLayout(dialog);
+            if (!insideRect(geo.box, x, y) || insideRect(geo.close, x, y)) {
+                this.closeFilterDialog();
+                return;
+            }
+            if (insideRect(geo.addInclude, x, y)) {
+                this.promptAddKeyword('include');
+                return;
+            }
+            if (insideRect(geo.addIgnore, x, y)) {
+                this.promptAddKeyword('ignore');
+                return;
+            }
+            for (let i = 0; i < geo.rows.length; i++) {
+                const row = geo.rows[i];
+                if (insideRect(this.dialogRemoveRect(row.y, geo.box), x, y)) {
+                    this.removeKeyword(row.kind, row.index);
+                    return;
+                }
+            }
+        }
+        renderFilterDialog() {
+            const dialog = this.filterDialog;
+            const ctx = this.ctx;
+            if (!dialog || !ctx)
+                return;
+            const geo = this.getDialogLayout(dialog);
+            const left = geo.box.x + 12;
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+            ctx.fillRect(0, 0, this.size.width, this.size.height);
+            roundRectPath(ctx, geo.box.x, geo.box.y, geo.box.w, geo.box.h, 10);
+            ctx.fillStyle = COLORS.panelBg;
+            ctx.fill();
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = COLORS.panelBorder;
+            ctx.stroke();
+            ctx.textBaseline = 'middle';
+            ctx.textAlign = 'left';
+            ctx.font = FONT_BOLD;
+            ctx.fillStyle = COLORS.title;
+            ctx.fillText('日志筛选', left, geo.box.y + 20);
+            this.renderFlatButton(geo.close, '×', '#e0e0e0', 16);
+            const sections = [
+                {
+                    title: '筛选（只显示命中）',
+                    color: COLORS.info,
+                    words: dialog.include,
+                    titleY: geo.includeTitleY,
+                    top: geo.includeTop,
+                    empty: '空 · 全部日志都显示',
+                },
+                {
+                    title: '排除（整条丢弃 · 存本地）',
+                    color: COLORS.error,
+                    words: dialog.ignore,
+                    titleY: geo.ignoreTitleY,
+                    top: geo.ignoreTop,
+                    empty: '空 · 所有日志都会记录',
+                },
+            ];
+            for (let s = 0; s < sections.length; s++) {
+                const sec = sections[s];
+                ctx.textAlign = 'left';
+                ctx.font = FONT_SMALL;
+                ctx.fillStyle = sec.color;
+                ctx.fillText(sec.title, left, sec.titleY);
+                if (!sec.words.length) {
+                    ctx.fillStyle = COLORS.dim;
+                    ctx.fillText(sec.empty, left + 4, sec.top);
+                    continue;
+                }
+                const shown = Math.min(sec.words.length, DIALOG_MAX_WORDS);
+                for (let i = 0; i < shown; i++) {
+                    const rowY = sec.top + i * DIALOG_ROW_H;
+                    roundRectPath(ctx, left, rowY - DIALOG_ROW_H / 2 + 3, geo.box.w - 24, DIALOG_ROW_H - 6, 5);
+                    ctx.fillStyle = COLORS.cardBg;
+                    ctx.fill();
+                    ctx.textAlign = 'left';
+                    ctx.fillStyle = sec.color;
+                    ctx.fillText(this.ellipsis(sec.words[i], geo.box.w - 24 - 32), left + 8, rowY);
+                    const remove = this.dialogRemoveRect(rowY, geo.box);
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = COLORS.dim;
+                    ctx.fillText('×', remove.x + remove.w / 2, remove.y + remove.h / 2);
+                }
+                if (sec.words.length > DIALOG_MAX_WORDS) {
+                    ctx.textAlign = 'left';
+                    ctx.fillStyle = COLORS.dim;
+                    ctx.fillText('还有 ' + (sec.words.length - DIALOG_MAX_WORDS) + ' 个，用 API 查看全部', left + 8, sec.top + DIALOG_MAX_WORDS * DIALOG_ROW_H);
+                }
+            }
+            this.renderFlatButton(geo.addInclude, '+ 筛选词', COLORS.info);
+            this.renderFlatButton(geo.addIgnore, '+ 排除词', COLORS.error);
+            ctx.textAlign = 'left';
+            ctx.font = FONT_SMALL;
+            ctx.fillStyle = this.dialogTip ? COLORS.warn : COLORS.dim;
+            ctx.fillText(this.dialogTip || '排除词会存本地；筛选只影响显示', left, geo.tipY);
         }
         hitButton(x, y) {
             const dx = x - this.button.x;
@@ -1326,6 +1812,9 @@
             };
             const close = { x: panel.x + panel.w - 8 - 30, y: panel.y + 6, w: 30, h: 28 };
             const clear = { x: close.x - 8 - 48, y: panel.y + 8, w: 48, h: 24 };
+            // 「筛选」放在「清空」左边；窄屏时先保证标题区还剩 90px
+            const filterW = Math.max(30, Math.min(46, clear.x - 6 - panel.x - 90));
+            const filterBtn = { x: clear.x - 6 - filterW, y: panel.y + 8, w: filterW, h: 24 };
             const chips = [];
             // 六个 tab，窄屏时自动缩窄，避免挤出面板
             const chipGap = 6;
@@ -1338,7 +1827,7 @@
                 chips.push({ level: item.level, label: item.label, rect: { x: chipX, y: chipY, w: chipW, h: chipH } });
                 chipX += chipW + chipGap;
             });
-            return { panel, header, toolbar, netBar, list, clear, close, chips };
+            return { panel, header, toolbar, netBar, list, filterBtn, clear, close, chips };
         }
         renderButton() {
             const ctx = this.ctx;
@@ -1359,6 +1848,9 @@
         renderPanel() {
             const ctx = this.ctx;
             const layout = this.getLayout();
+            // 标题栏要显示筛选后的条数，先把列表缓存算出来；renderList 会命中同一份
+            if (this.filter !== 'net')
+                this.getListCache(Math.max(40, layout.list.w - 26));
             ctx.fillStyle = COLORS.maskBg;
             ctx.fillRect(0, 0, this.size.width, this.size.height);
             // 面板底
@@ -1388,6 +1880,7 @@
                 const countWidth = ctx.measureText(countText).width;
                 ctx.fillText(this.versionLabel, layout.header.x + 12 + titleWidth + 8 + countWidth + 8, titleY + 1);
             }
+            this.renderFlatButton(layout.filterBtn, '筛选', '#9ecbff');
             this.renderFlatButton(layout.clear, '清空', '#e0e0e0');
             this.renderFlatButton(layout.close, '×', '#e0e0e0', 16);
             // 过滤条
@@ -1414,10 +1907,23 @@
                 const total = this.net.total();
                 return pending > 0 ? total + ' · ' + pending + ' 进行中' : String(total);
             }
-            const consoleTotal = this.store.count('all');
-            if (this.filter === 'all')
-                return String(consoleTotal);
-            return this.store.count(this.filter) + '/' + consoleTotal;
+            // 用筛选后的条数：1000 条历史里只有命中的才显示，标题栏要跟着变
+            const cache = this.listCache;
+            const stored = this.store.count('all');
+            const matched = cache ? cache.counts.all : stored;
+            const shown = cache ? cache.entries.length : stored;
+            if (this.filter === 'all') {
+                // 显示上限截断时写成「显示 300 / 命中 1000」，否则容易误以为日志丢了；
+                // 有筛选词时再带上库内总数「命中 111 / 共 1000」，说明历史还在
+                if (shown < matched)
+                    return shown + '/' + matched;
+                if (matched < stored)
+                    return matched + '/' + stored;
+                return String(stored);
+            }
+            const total = matched;
+            const current = cache ? cache.counts[this.filter] || 0 : this.store.count(this.filter);
+            return current + '/' + total;
         }
         /** net tab 顶部状态栏：在线状态 + 网络类型 + 进行中/总数 */
         renderNetBar(rect) {
@@ -1452,10 +1958,12 @@
                 return '在线 · WIFI';
             return '在线 · ' + type.toUpperCase();
         }
-        /** 网络状态变化（宿主回调 / 轮询兜底），只在面板打开时触发重绘 */
+        /** 网络状态变化（宿主回调 / 轮询兜底），只在面板打开且状态真的变了才重绘 */
         applyNetState(state) {
+            const changed = state.online !== this.netState.online || state.type !== this.netState.type;
             this.netState = state;
-            this.addLog();
+            if (changed)
+                this.onNetChange();
         }
         /** 有请求进行中时按固定间隔重绘，让耗时实时跳动 */
         scheduleTick() {
@@ -1480,6 +1988,12 @@
                 g.clearTimeout(this.tickTimer);
                 this.tickTimer = null;
             }
+            if (this.throttleTimer !== null && typeof g.clearTimeout === 'function') {
+                g.clearTimeout(this.throttleTimer);
+                this.throttleTimer = null;
+            }
+            this.clearDialogTipTimer();
+            this.filterDialog = null;
             if (this.netStateTimer) {
                 try {
                     this.netStateTimer();
@@ -1516,6 +2030,7 @@
             const maxWidth = Math.max(40, listRect.w - 26);
             const cache = this.getListCache(maxWidth);
             const filtered = cache.entries;
+            this.rowHits.length = 0;
             if (!filtered.length) {
                 ctx.fillStyle = COLORS.dim;
                 ctx.font = FONT;
@@ -1539,10 +2054,20 @@
                     bottom = top;
                     continue;
                 }
-                if (filtered[i].runs)
-                    this.renderRichRow(filtered[i], cache.runs[i], listRect.x, top, rowHeight);
-                else
-                    this.renderRow(filtered[i], cache.lines[i], listRect.x, top, rowHeight);
+                const expanded = this.expandedLogIds.indexOf(filtered[i].id) >= 0;
+                if (cache.expandable[i]) {
+                    this.rowHits.push({
+                        id: filtered[i].id,
+                        rect: { x: listRect.x, y: top, w: listRect.w, h: rowHeight },
+                        expandable: true,
+                    });
+                }
+                if (filtered[i].runs) {
+                    this.renderRichRow(filtered[i], cache.runs[i], listRect.x, top, rowHeight, cache.expandable[i], expanded);
+                }
+                else {
+                    this.renderRow(filtered[i], cache.lines[i], listRect.x, top, rowHeight, cache.expandable[i], expanded);
+                }
                 bottom = top;
                 if (top < topEdge)
                     break;
@@ -1555,42 +2080,83 @@
          * 拖动滚动条时不再重复分配这些数组。
          */
         getListCache(maxWidth) {
+            var _a, _b;
+            const expandedKey = this.expandedLogIds.join(',');
             const cache = this.listCache;
             if (cache &&
                 cache.version === this.store.version &&
                 cache.filter === this.filter &&
-                cache.width === maxWidth) {
+                cache.width === maxWidth &&
+                cache.expandedKey === expandedKey) {
                 return cache;
             }
             const entries = this.store.list();
+            // 被上限淘汰掉的旧日志不再保留展开状态
+            const oldest = entries.length ? entries[0].id : 0;
+            for (let i = this.expandedLogIds.length - 1; i >= 0; i--) {
+                if (this.expandedLogIds[i] < oldest)
+                    this.expandedLogIds.splice(i, 1);
+            }
             const filtered = [];
             const heights = [];
             const lines = [];
             const runs = [];
-            let contentHeight = 0;
+            const expandable = [];
+            const counts = { all: 0, log: 0, info: 0, warn: 0, error: 0 };
             for (let i = 0; i < entries.length; i++) {
                 const entry = entries[i];
+                // 筛选作用在展示层：内存里 1000 条全部保留，靠筛选词往回翻历史
+                if (!this.store.matchesInclude(entry))
+                    continue;
+                counts.all++;
+                counts[entry.level] = (counts[entry.level] || 0) + 1;
                 if (!matchesFilter(entry, this.filter))
                     continue;
+                const expanded = this.expandedLogIds.indexOf(entry.id) >= 0;
                 filtered.push(entry);
                 if (entry.runs) {
-                    const runLines = this.layoutRuns(entry, maxWidth);
+                    const runLines = this.layoutRuns(entry, maxWidth, expanded);
+                    const canExpand = expanded ? runLines.length > COLLAPSED_LINES : !!((_a = entry.runWrapCache) === null || _a === void 0 ? void 0 : _a.more);
                     runs.push(runLines);
                     lines.push([]);
-                    const height = runLines.length * LINE_HEIGHT + ROW_GAP;
-                    heights.push(height);
-                    contentHeight += height;
+                    heights.push(runLines.length * LINE_HEIGHT + ROW_GAP + (canExpand ? EXPAND_HINT_H : 0));
+                    expandable.push(canExpand);
                 }
                 else {
-                    const wrapped = this.wrapEntry(entry, maxWidth);
+                    const wrapped = this.wrapEntry(entry, maxWidth, expanded);
+                    const canExpand = expanded ? wrapped.length > COLLAPSED_LINES : !!((_b = entry.wrapCache) === null || _b === void 0 ? void 0 : _b.more);
                     lines.push(wrapped);
                     runs.push([]);
-                    const height = wrapped.length * LINE_HEIGHT + ROW_GAP;
-                    heights.push(height);
-                    contentHeight += height;
+                    heights.push(wrapped.length * LINE_HEIGHT + ROW_GAP + (canExpand ? EXPAND_HINT_H : 0));
+                    expandable.push(canExpand);
                 }
             }
-            this.listCache = { version: this.store.version, filter: this.filter, width: maxWidth, entries: filtered, heights, lines, runs, contentHeight };
+            // 显示上限：只往回画最近 N 条，更早的历史留在内存里，靠筛选词才能看到
+            const limit = this.store.displayLimit;
+            if (limit > 0 && filtered.length > limit) {
+                const overflow = filtered.length - limit;
+                filtered.splice(0, overflow);
+                heights.splice(0, overflow);
+                lines.splice(0, overflow);
+                runs.splice(0, overflow);
+                expandable.splice(0, overflow);
+            }
+            let contentHeight = 0;
+            for (let i = 0; i < heights.length; i++)
+                contentHeight += heights[i];
+            this.listCache = {
+                version: this.store.version,
+                filter: this.filter,
+                width: maxWidth,
+                expandedKey,
+                entries: filtered,
+                heights,
+                lines,
+                runs,
+                expandable,
+                counts,
+                contentHeight,
+            };
             return this.listCache;
         }
         emptyText() {
@@ -1841,7 +2407,7 @@
                     return COLORS.dim;
             }
         }
-        renderRow(entry, lines, listX, top, height) {
+        renderRow(entry, lines, listX, top, height, expandable, expanded) {
             const ctx = this.ctx;
             const color = levelColor(entry.level);
             ctx.fillStyle = color;
@@ -1852,9 +2418,24 @@
             for (let i = 0; i < lines.length; i++) {
                 ctx.fillText(lines[i], listX + 16, top + 3 + i * LINE_HEIGHT);
             }
+            if (expandable)
+                this.renderExpandHint(top, lines.length, expanded);
+        }
+        /** 可展开的行在最后一行下面留一条窄带标出「展开 / 收起」，不压正文 */
+        renderExpandHint(top, lineCount, expanded) {
+            const ctx = this.ctx;
+            const listRect = this.layout ? this.layout.list : null;
+            if (!listRect)
+                return;
+            ctx.font = FONT_SMALL;
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            ctx.fillStyle = COLORS.dim;
+            ctx.fillText(expanded ? '收起' : '展开全文', listRect.x + 16, top + 2 + lineCount * LINE_HEIGHT);
+            ctx.font = FONT;
         }
         /** 富文本渲染：带 %c 样式的日志走这条路径，先铺背景再画文字 */
-        renderRichRow(entry, lines, listX, top, height) {
+        renderRichRow(entry, lines, listX, top, height, expandable, expanded) {
             const ctx = this.ctx;
             ctx.fillStyle = levelColor(entry.level);
             ctx.fillRect(listX + 8, top + 3, 2, Math.max(4, height - ROW_GAP - 2));
@@ -1898,15 +2479,19 @@
                 }
             }
             ctx.font = FONT;
+            if (expandable)
+                this.renderExpandHint(top, lines.length, expanded);
         }
         /**
          * 富文本换行：按字符累加宽度，样式切换或超宽时切段/换行。
          * 时间前缀作为无样式的一段拼在最前面，结果缓存在 entry 上。
          */
-        layoutRuns(entry, maxWidth) {
+        layoutRuns(entry, maxWidth, expanded) {
             const cache = entry.runWrapCache;
-            if (cache && cache.width === maxWidth)
+            if (cache && cache.width === maxWidth && !!cache.expanded === expanded)
                 return cache.lines;
+            // 收起时多算一行用于判断「是否还有更多」
+            const limit = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES + 1;
             const ctx = this.ctx;
             const runs = entry.runs || [];
             const lines = [{ pieces: [] }];
@@ -1936,7 +2521,7 @@
                 const padX = style && style.paddingX ? style.paddingX : 0;
                 ctx.font = style && style.bold ? FONT_RUN_BOLD : FONT;
                 for (let i = 0; i < text.length; i++) {
-                    if (lines.length > MAX_LINES_PER_ENTRY)
+                    if (lines.length > limit)
                         return;
                     const ch = text.charAt(i);
                     if (ch === '\n') {
@@ -1968,27 +2553,44 @@
             while (lines.length && !lines[lines.length - 1].pieces.length)
                 lines.pop();
             ctx.font = FONT;
-            entry.runWrapCache = { width: maxWidth, lines };
+            // 超出可见行数就截断，并在最后一行补一个省略号片段
+            const visible = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES;
+            const more = lines.length > visible;
+            if (more) {
+                lines.length = visible;
+                const last = lines[visible - 1];
+                const tail = last.pieces[last.pieces.length - 1];
+                const tailX = tail ? tail.x + tail.padX * 2 + tail.w : 0;
+                last.pieces.push({ text: ' …', x: tailX, w: 0, padX: 0 });
+            }
+            entry.runWrapCache = { width: maxWidth, expanded, more, lines };
             return lines;
         }
         /** 按面板宽度换行，结果缓存在 entry 上，日志不变就不重复测量 */
-        wrapEntry(entry, maxWidth) {
+        wrapEntry(entry, maxWidth, expanded) {
             const cache = entry.wrapCache;
-            if (cache && cache.width === maxWidth)
+            if (cache && cache.width === maxWidth && !!cache.expanded === expanded)
                 return cache.lines;
+            // 收起时只要判断「是否还有更多」，多量一行就够，不必量满 40 行
+            const limit = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES + 1;
             const ctx = this.ctx;
             const content = '[' + entry.time + '] ' + entry.text;
             const lines = [];
             const paragraphs = content.split('\n');
+            let more = false;
             ctx.font = FONT;
-            for (let p = 0; p < paragraphs.length; p++) {
+            for (let p = 0; p < paragraphs.length && !more; p++) {
                 const paragraph = paragraphs[p];
                 if (!paragraph) {
                     lines.push('');
+                    if (lines.length >= limit)
+                        more = true;
                     continue;
                 }
                 if (ctx.measureText(paragraph).width <= maxWidth) {
                     lines.push(paragraph);
+                    if (lines.length >= limit)
+                        more = true;
                     continue;
                 }
                 let line = '';
@@ -1997,23 +2599,34 @@
                     if (line && ctx.measureText(next).width > maxWidth) {
                         lines.push(line);
                         line = paragraph[i];
-                        if (lines.length >= MAX_LINES_PER_ENTRY)
+                        if (lines.length >= limit) {
+                            more = true;
                             break;
+                        }
                     }
                     else {
                         line = next;
                     }
                 }
-                if (lines.length >= MAX_LINES_PER_ENTRY)
+                if (more)
                     break;
-                if (line)
+                if (line) {
                     lines.push(line);
+                    if (lines.length >= limit)
+                        more = true;
+                }
             }
-            if (lines.length >= MAX_LINES_PER_ENTRY) {
+            if (!expanded) {
+                if (more) {
+                    lines.length = COLLAPSED_LINES;
+                    lines[COLLAPSED_LINES - 1] = lines[COLLAPSED_LINES - 1] + ' …';
+                }
+            }
+            else if (lines.length >= MAX_LINES_PER_ENTRY) {
                 lines.length = MAX_LINES_PER_ENTRY;
                 lines[MAX_LINES_PER_ENTRY - 1] = lines[MAX_LINES_PER_ENTRY - 1] + ' …';
             }
-            entry.wrapCache = { width: maxWidth, lines };
+            entry.wrapCache = { width: maxWidth, expanded, more, lines };
             return lines;
         }
     }
@@ -2377,6 +2990,8 @@
             this.seq = 0;
             /** 进行中的条数，实时刷新时每帧都要读，不能每次遍历 */
             this.pendingCount = 0;
+            /** 内容版本号，UI 靠它判断这一帧是否和上一帧一样、能否直接跳过重绘 */
+            this.version = 0;
             this.maxRecords = maxRecords;
         }
         /** 请求发出时调用，返回记录 id，成功后用 finish 补全 */
@@ -2476,6 +3091,7 @@
             return null;
         }
         emit() {
+            this.version++;
             for (let i = 0; i < this.listeners.length; i++) {
                 try {
                     this.listeners[i]();
@@ -2611,10 +3227,11 @@
      *      挂出可拖拽悬浮按钮，避免抢占“第一个 canvas 即上屏画布”的名额。
      *
      * 想手动控制：
-     *   LogPanel.init({ maxLogs: 500 });                 // 可重复调用，用于补充配置
-     *   LogPanel.setMaxLogs(200)                         // 运行时改条数上限
+     *   LogPanel.init({ maxLogs: 1000, displayLimit: 300 });  // 可重复调用，用于补充配置
+     *   LogPanel.setMaxLogs(500)                         // 运行时改内存条数上限
+     *   LogPanel.setDisplayLimit(300)                    // 运行时改渲染条数
      *   LogPanel.addIgnoreKeywords(['xxx'])              // 追加排除词（命中不入库、不占上限）
-     *   LogPanel.setIncludeKeywords(['yyy'])             // 只保留含 yyy 的日志（同样不占上限）
+     *   LogPanel.setIncludeKeywords(['yyy'])             // 只显示含 yyy 的日志（含已存历史）
      *   LogPanel.show() / hide() / toggle() / clear() / destroy()
      * 想关掉自动初始化，请在加载本文件之前设置：
      *   globalThis.__LOG_PANEL_AUTO_INIT__ = false
@@ -2624,6 +3241,36 @@
     const HOST_POLL_INTERVAL = 50;
     /** 面板画布默认的像素比上限，见 LogPanelOptions.maxPixelRatio */
     const DEFAULT_MAX_PIXEL_RATIO = 2;
+    /** 内存里保留的日志条数，memory 里存得多一些，方便用筛选词往回翻 */
+    const DEFAULT_MAX_LOGS = 1000;
+    /** 面板一次最多渲染多少条 */
+    const DEFAULT_DISPLAY_LIMIT = 300;
+    /** 排除词存在本地存储里的 key，重启后自动读回来 */
+    const IGNORE_STORAGE_KEY = '__LOG_PANEL_IGNORE_KEYWORDS__';
+    /** 读本地存过的排除词；null 表示从没存过（用内置默认词） */
+    function loadIgnoreKeywords() {
+        const raw = readStorage(IGNORE_STORAGE_KEY);
+        if (!raw)
+            return null;
+        try {
+            const data = JSON.parse(raw);
+            if (!Array.isArray(data))
+                return null;
+            const words = [];
+            for (let i = 0; i < data.length; i++) {
+                if (typeof data[i] === 'string' && data[i])
+                    words.push(data[i]);
+            }
+            // 空数组也要认：用户把词全删了，下次启动就该保持不排除
+            return words;
+        }
+        catch (e) {
+            return null;
+        }
+    }
+    function saveIgnoreKeywords(words) {
+        writeStorage(IGNORE_STORAGE_KEY, JSON.stringify(words || []));
+    }
     /** 构建时由 rollup 从 package.json 注入，运行时可以通过 LogPanel.version 读到 */
     const VERSION = '1.0.0';
     let store = null;
@@ -2663,10 +3310,18 @@
             return;
         started = true;
         const opts = pendingOptions;
-        const logs = new LogStore(opts.maxLogs && opts.maxLogs > 0 ? opts.maxLogs : 300);
+        const logs = new LogStore(opts.maxLogs && opts.maxLogs > 0 ? opts.maxLogs : DEFAULT_MAX_LOGS);
+        logs.displayLimit = opts.displayLimit && opts.displayLimit > 0 ? Math.floor(opts.displayLimit) : DEFAULT_DISPLAY_LIMIT;
         const net = new NetStore(opts.maxNetRecords && opts.maxNetRecords > 0 ? opts.maxNetRecords : 100);
+        // 本地存的排除词优先恢复，这样引擎启动阶段最早的日志就能被过滤掉；
+        // 代码里配置的排除词每次都重新叠加，不会被本地记录冲掉
+        const savedKeywords = loadIgnoreKeywords();
+        if (savedKeywords)
+            logs.setIgnoreKeywords(savedKeywords);
         if (opts.ignoreKeywords && opts.ignoreKeywords.length)
             logs.addIgnoreKeywords(opts.ignoreKeywords);
+        // 之后面板里的增删（含 init 补的配置）都写回本地，重启仍然生效
+        logs.onIgnoreKeywordsChange = saveIgnoreKeywords;
         if (opts.includeKeywords && opts.includeKeywords.length)
             logs.addIncludeKeywords(opts.includeKeywords);
         store = logs;
@@ -2718,8 +3373,8 @@
         }
         if (screen)
             screen.onReady = () => panelView.invalidate();
-        offStoreChange = logs.onChange(() => panelView.addLog());
-        offNetChange = net.onChange(() => panelView.addLog());
+        offStoreChange = logs.onChange(() => panelView.onStoreChange());
+        offNetChange = net.onChange(() => panelView.onNetChange());
         unbindTouch = bindTouch(canvas, (x, y, phase) => panelView.handleTouch(x, y, phase));
         unbindResize = bindResize(() => {
             const next = getScreenSize(opts.maxPixelRatio === undefined ? DEFAULT_MAX_PIXEL_RATIO : opts.maxPixelRatio);
@@ -2789,6 +3444,8 @@
             // 已经自动初始化过，这里只补充配置
             if (opts.maxLogs && opts.maxLogs > 0)
                 store.setMaxLogs(opts.maxLogs);
+            if (opts.displayLimit && opts.displayLimit > 0)
+                store.setDisplayLimit(opts.displayLimit);
             if (opts.maxNetRecords && opts.maxNetRecords > 0 && netStore)
                 netStore.setMaxRecords(opts.maxNetRecords);
             if (opts.ignoreKeywords && opts.ignoreKeywords.length)
@@ -2876,6 +3533,10 @@
         setMaxLogs(maxLogs) {
             if (store)
                 store.setMaxLogs(maxLogs);
+        },
+        setDisplayLimit(limit) {
+            if (store)
+                store.setDisplayLimit(limit);
         },
         setMaxNetRecords(maxRecords) {
             if (netStore)

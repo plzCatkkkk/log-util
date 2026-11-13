@@ -4,7 +4,7 @@
  */
 import { matchesFilter } from './console';
 import type { LogEntry, LogFilter, LogLevel, LogStore, TextStyle } from './console';
-import { bindNetworkState, resizeCanvas } from './env';
+import { bindNetworkState, getMyApi, resizeCanvas } from './env';
 import type { NetworkState, ScreenSize } from './env';
 import type { NetRecord, NetStore } from './network';
 
@@ -18,6 +18,10 @@ const FONT_SMALL = '11px sans-serif';
 const LINE_HEIGHT = 17;
 const ROW_GAP = 6;
 const MAX_LINES_PER_ENTRY = 40;
+/** 收起状态下每条日志最多显示几行，点开才展开到 MAX_LINES_PER_ENTRY */
+const COLLAPSED_LINES = 4;
+/** 可展开的行在正文下面留出的「展开全文」提示带高度 */
+const EXPAND_HINT_H = 15;
 
 /** 网络卡片：行高、卡片间距、上下内边距 */
 const NET_LINE_HEIGHT = 15;
@@ -28,6 +32,16 @@ const NET_DETAIL_TOP = 45;
 const MAX_DETAIL_LINES = 80;
 /** 有请求进行中时的实时刷新间隔 */
 const NET_TICK_INTERVAL = 400;
+/**
+ * 日志密集写入时两帧之间至少隔这么久。
+ * 触摸交互走 requestAnimationFrame 保持跟手，只有日志驱动的重绘才限速。
+ */
+const LOG_FRAME_GAP = 50;
+
+/** 筛选弹窗每段最多列出多少个词，超出的给一行提示 */
+const DIALOG_MAX_WORDS = 6;
+/** 筛选弹窗里一行关键词的高度 */
+const DIALOG_ROW_H = 26;
 
 const COLORS = {
   maskBg: 'rgba(0, 0, 0, 0.38)',
@@ -85,14 +99,52 @@ interface Layout {
   /** net tab 的网络状态条，其他 tab 高度为 0 */
   netBar: Rect;
   list: Rect;
+  /** 标题栏左侧的「筛选」按钮，打开筛选词弹窗 */
+  filterBtn: Rect;
   clear: Rect;
   close: Rect;
   chips: ChipHit[];
 }
 
+/** 筛选弹窗里一行关键词（含右侧删除按钮） */
+interface DialogRow {
+  kind: 'include' | 'ignore';
+  index: number;
+  word: string;
+  y: number;
+}
+
+interface DialogLayout {
+  box: Rect;
+  close: Rect;
+  addInclude: Rect;
+  addIgnore: Rect;
+  includeTitleY: number;
+  ignoreTitleY: number;
+  /** 两段各自的内容起始 y（行中心点） */
+  includeTop: number;
+  ignoreTop: number;
+  rows: DialogRow[];
+  tipY: number;
+}
+
+/** 筛选弹窗的内存状态：改动先在本地累积，每次增删立即回写到 store */
+interface FilterDialogState {
+  include: string[];
+  ignore: string[];
+}
+
 interface NetHit {
   id: number;
   rect: Rect;
+}
+
+/** 日志行的命中区，只在画出来的可见行上记录 */
+interface LogRowHit {
+  id: number;
+  rect: Rect;
+  /** 内容超过收起行数，点头可以展开 / 收起 */
+  expandable: boolean;
 }
 
 /** 富文本换行后的一个片段：x 相对正文左边界，padX 是左右内边距 */
@@ -113,10 +165,16 @@ interface ListCache {
   version: number;
   filter: LogFilter;
   width: number;
+  /** 展开态集合的快照，变了就要重建 */
+  expandedKey: string;
   entries: LogEntry[];
   heights: number[];
   lines: string[][];
   runs: RunLine[][];
+  /** 每条日志的内容是否超过收起行数 */
+  expandable: boolean[];
+  /** 筛选后各级别的条数（不受显示上限截断），给标题栏和 tab 用 */
+  counts: Record<string, number>;
   contentHeight: number;
 }
 
@@ -182,6 +240,12 @@ export class LogPanelView {
   private netHits: NetHit[] = [];
   /** 按下时落在哪张网络卡片上，抬手没滑动就切换展开 */
   private pendingCardId: number | null = null;
+  /** 内容超过收起行数、被手动展开的日志 id（只记少数几条） */
+  private expandedLogIds: number[] = [];
+  /** 上一帧渲染出来的日志行命中区 */
+  private rowHits: LogRowHit[] = [];
+  /** 按下时落在哪条日志上，抬手没滑动就切换展开 */
+  private pendingRowId: number | null = null;
   private netState: NetworkState = { online: true, type: 'unknown' };
   private netStateTimer: any = null;
   private tickTimer: any = null;
@@ -189,6 +253,18 @@ export class LogPanelView {
   private layoutCache: Layout | null = null;
   private layoutKey = '';
   private listCache: ListCache | null = null;
+  /** 上一帧的状态快照，相同就跳过重画 */
+  private frameKey = '';
+  /** 上一帧绘制时刻，用于日志驱动的重绘限速 */
+  private lastRenderAt = 0;
+  /** 限速等待中的定时器；交互来了可以提前取消 */
+  private throttleTimer: any = null;
+
+  /** 筛选词弹窗，null 表示未打开 */
+  private filterDialog: FilterDialogState | null = null;
+  /** 弹窗底部的一行提示（比如当前环境不支持输入） */
+  private dialogTip = '';
+  private dialogTipTimer: any = null;
 
   private button: { x: number; y: number; r: number };
   private layout: Layout | null = null;
@@ -259,6 +335,9 @@ export class LogPanelView {
     if (!this.visible) return;
     this.visible = false;
     this.touchMode = 'none';
+    this.filterDialog = null;
+    this.dialogTip = '';
+    this.clearDialogTipTimer();
     if (this.onOpenChange) this.onOpenChange(false);
     this.invalidate();
   }
@@ -268,12 +347,54 @@ export class LogPanelView {
     else this.show();
   }
 
-  addLog(): void {
-    if (this.visible) this.invalidate();
+  /** console 日志变化：net tab 里不显示日志内容，不用重画 */
+  onStoreChange(): void {
+    if (!this.visible || this.filter === 'net') return;
+    this.invalidateThrottled();
+  }
+
+  /** 网络记录变化：只有 net tab 会用到 */
+  onNetChange(): void {
+    if (!this.visible || this.filter !== 'net') return;
+    this.invalidateThrottled();
+  }
+
+  /**
+   * 数据变化触发的重绘：日志成批刷屏时限制到 LOG_FRAME_GAP 一帧，
+   * 避免每条日志都带来一次全屏纹理上传。
+   */
+  invalidateThrottled(): void {
+    if (this.pending) return;
+    const now = Date.now();
+    const wait = LOG_FRAME_GAP - (now - this.lastRenderAt);
+    if (wait <= 0) {
+      this.invalidate();
+      return;
+    }
+
+    this.pending = true;
+    const g: any = globalThis as any;
+    if (typeof g.setTimeout !== 'function') {
+      this.pending = false;
+      this.invalidate();
+      return;
+    }
+    this.throttleTimer = g.setTimeout(() => {
+      this.throttleTimer = null;
+      this.pending = false;
+      this.render();
+    }, wait);
   }
 
   invalidate(): void {
-    if (this.pending) return;
+    if (this.pending) {
+      // 交互触发的重绘要跟手：把限速中的等待提前到下一帧
+      if (this.throttleTimer === null) return;
+      const g: any = globalThis as any;
+      if (typeof g.clearTimeout === 'function') g.clearTimeout(this.throttleTimer);
+      this.throttleTimer = null;
+      this.pending = false;
+    }
     this.pending = true;
 
     const g: any = globalThis as any;
@@ -299,12 +420,22 @@ export class LogPanelView {
     const ctx = this.ctx;
     if (!ctx) return;
 
+    // 内容和上一帧完全一样就直接跳过：一次重画 = 一次清屏 + 一次全屏纹理上传
+    const key = this.frameKeyOf();
+    if (key === this.frameKey) return;
+    this.frameKey = key;
+    this.lastRenderAt = Date.now();
+
     const dpr = this.size.pixelRatio || 1;
     if (typeof ctx.setTransform === 'function') ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.size.width, this.size.height);
 
     if (this.visible) this.renderPanel();
     else this.renderButton();
+    if (this.visible && this.filterDialog) this.renderFilterDialog();
+
+    // 滚动位置在绘制里可能被夹紧，按夹紧后的状态记录，避免下一帧白画一次
+    this.frameKey = this.frameKeyOf();
 
     if (this.onFrame) {
       try {
@@ -313,6 +444,42 @@ export class LogPanelView {
         // 上屏失败不能影响绘制
       }
     }
+  }
+
+  /** 决定这一帧画面内容的状态快照；相同就说明重画没有意义 */
+  private frameKeyOf(): string {
+    let key =
+      (this.visible ? '1' : '0') +
+      '|' + this.filter +
+      '|' + this.scroll +
+      '|' + this.store.version +
+      '|' + (this.netState.online ? '1' : '0') + this.netState.type +
+      '|' + this.size.width + 'x' + this.size.height + '@' + this.size.pixelRatio;
+
+    if (this.visible) {
+      // net tab 的内容全在 NetStore 里；console tab 不依赖它
+      if (this.filter === 'net') {
+        key += '|' + this.net.version + ':' + this.net.total();
+        // 有请求在跑时耗时是实时跳的，按 tick 周期变化让去重放行
+        if (this.net.pending() > 0) key += '|t' + Math.floor(Date.now() / NET_TICK_INTERVAL);
+      }
+      key += '|' + (this.expandedNetId === null ? '' : this.expandedNetId);
+      // 日志行的展开状态会影响行高和内容，必须进签名
+      if (this.expandedLogIds.length) key += '|e' + this.expandedLogIds.join(',');
+      if (this.filterDialog) {
+        key +=
+          '|d' +
+          this.filterDialog.include.join(',') +
+          ';' +
+          this.filterDialog.ignore.join(',') +
+          ';' +
+          this.dialogTip;
+      }
+    } else {
+      // 收起态只画悬浮按钮，位置变了才需要重画
+      key += '|' + this.button.x + ',' + this.button.y + ',' + this.button.r;
+    }
+    return key;
   }
 
   /** 触摸分发，返回 true 表示面板消费了这一次触摸 */
@@ -332,6 +499,13 @@ export class LogPanelView {
       const layout = this.layout;
       if (!layout) return false;
 
+      // 筛选词弹窗在最上层：打开时所有触摸都归它，点弹窗外即关闭
+      if (this.filterDialog) {
+        this.touchMode = 'consumed';
+        this.handleDialogTouch(x, y);
+        return true;
+      }
+
       // 点在面板外的遮罩上（上方留白区域）：直接收起
       if (!insideRect(layout.panel, x, y)) {
         this.hide();
@@ -344,10 +518,16 @@ export class LogPanelView {
         this.touchMode = 'consumed';
         return true;
       }
+      if (insideRect(layout.filterBtn, x, y)) {
+        this.openFilterDialog();
+        this.touchMode = 'consumed';
+        return true;
+      }
       if (insideRect(layout.clear, x, y)) {
         this.store.clear();
         this.net.clear();
         this.expandedNetId = null;
+        this.expandedLogIds.length = 0;
         this.touchMode = 'consumed';
         return true;
       }
@@ -361,8 +541,14 @@ export class LogPanelView {
       if (insideRect(layout.list, x, y)) {
         this.touchMode = 'scroll';
         this.scrollStart = this.scroll;
-        // 网络 tab 里按下落在某张卡片上：抬手时若没滑动就展开/收起详情
-        this.pendingCardId = this.filter === 'net' ? this.hitNetCard(x, y) : null;
+        // 按下落在某张网络卡片 / 某条日志上：抬手时若没滑动就展开/收起
+        if (this.filter === 'net') {
+          this.pendingCardId = this.hitNetCard(x, y);
+          this.pendingRowId = null;
+        } else {
+          this.pendingCardId = null;
+          this.pendingRowId = this.hitLogRow(x, y);
+        }
         return true;
       }
       // 面板空白区域也吃掉，避免误触到下面的游戏
@@ -397,11 +583,15 @@ export class LogPanelView {
       if (this.touchMode === 'scroll') {
         const moved = Math.abs(x - this.touchStart.x) + Math.abs(y - this.touchStart.y);
         const cardId = this.pendingCardId;
+        const rowId = this.pendingRowId;
         this.pendingCardId = null;
+        this.pendingRowId = null;
         if (moved < 8 && cardId !== null) {
           this.expandedNetId = this.expandedNetId === cardId ? null : cardId;
           this.scroll = clamp(this.scroll, 0, this.maxScroll);
           this.invalidate();
+        } else if (moved < 8 && rowId !== null) {
+          this.toggleLogRow(rowId);
         }
       }
       this.touchMode = 'none';
@@ -417,11 +607,310 @@ export class LogPanelView {
     return null;
   }
 
+  /** 只把内容确实超过收起行数的行算作可点头的区域 */
+  private hitLogRow(x: number, y: number): number | null {
+    for (let i = this.rowHits.length - 1; i >= 0; i--) {
+      const hit = this.rowHits[i];
+      if (hit.expandable && insideRect(hit.rect, x, y)) return hit.id;
+    }
+    return null;
+  }
+
+  /** 切换一条日志的展开状态；展开后仍受 MAX_LINES_PER_ENTRY 行数上限约束 */
+  private toggleLogRow(id: number): void {
+    const index = this.expandedLogIds.indexOf(id);
+    if (index >= 0) {
+      this.expandedLogIds.splice(index, 1);
+    } else {
+      this.expandedLogIds.push(id);
+      // 展开的内容可能很长，把上限收紧一点，防止无限攒
+      if (this.expandedLogIds.length > 20) this.expandedLogIds.shift();
+    }
+    // 展开会让内容变高，滚动位置跟着夹紧到新的范围
+    this.scroll = clamp(this.scroll, 0, this.maxScroll);
+    this.invalidate();
+  }
+
   private setFilter(level: LogFilter): void {
     this.filter = level;
     this.scroll = 0;
     this.pendingCardId = null;
+    this.pendingRowId = null;
     this.invalidate();
+  }
+
+  /** 打开筛选词弹窗：把 store 里当前生效的筛选词/排除词取一份快照来编辑 */
+  private openFilterDialog(): void {
+    this.filterDialog = {
+      include: this.store.includeKeywords(),
+      ignore: this.store.ignoreKeywords(),
+    };
+    this.dialogTip = '';
+    this.clearDialogTipTimer();
+    this.invalidate();
+  }
+
+  private closeFilterDialog(): void {
+    this.filterDialog = null;
+    this.dialogTip = '';
+    this.clearDialogTipTimer();
+    this.invalidate();
+  }
+
+  /** 弹窗里的增删立即回写 store；注意只影响之后的新日志，历史日志需要清空 */
+  private applyDialogKeywords(): void {
+    const dialog = this.filterDialog;
+    if (!dialog) return;
+    this.store.setIncludeKeywords(dialog.include);
+    this.store.setIgnoreKeywords(dialog.ignore);
+    this.invalidate();
+  }
+
+  private removeKeyword(kind: 'include' | 'ignore', index: number): void {
+    const dialog = this.filterDialog;
+    if (!dialog) return;
+    const words = kind === 'include' ? dialog.include : dialog.ignore;
+    if (index < 0 || index >= words.length) return;
+    words.splice(index, 1);
+    this.applyDialogKeywords();
+  }
+
+  /** 新增关键词：小游戏里没有 DOM 输入框，走宿主的 my.prompt */
+  private promptAddKeyword(kind: 'include' | 'ignore'): void {
+    const dialog = this.filterDialog;
+    if (!dialog) return;
+
+    const my = getMyApi();
+    if (!my || typeof my.prompt !== 'function') {
+      this.setDialogTip('当前环境不支持输入，请用 LogPanel.addIncludeKeywords() 配置');
+      return;
+    }
+
+    my.prompt({
+      title: kind === 'include' ? '添加筛选词' : '添加排除词',
+      message: kind === 'include' ? '只显示包含该词的日志（含已存历史）' : '包含该词的日志整条丢弃',
+      placeholder: '例如 [BATTLE]',
+      success: (res: any) => {
+        // 输入期间弹窗被关掉就丢弃这次输入
+        if (this.filterDialog !== dialog) return;
+        if (!res || !res.ok) return;
+        const word = String(res.inputValue === undefined ? '' : res.inputValue).trim();
+        if (!word) return;
+
+        const target = kind === 'include' ? dialog.include : dialog.ignore;
+        const other = kind === 'include' ? dialog.ignore : dialog.include;
+        // 同一个词不能既筛又排，出现在另一段里就先挪过来
+        const otherIndex = other.indexOf(word);
+        if (otherIndex >= 0) other.splice(otherIndex, 1);
+        if (target.indexOf(word) < 0) target.push(word);
+        this.applyDialogKeywords();
+      },
+    });
+  }
+
+  private setDialogTip(text: string): void {
+    this.dialogTip = text;
+    this.clearDialogTipTimer();
+    const g: any = globalThis as any;
+    if (typeof g.setTimeout === 'function') {
+      this.dialogTipTimer = g.setTimeout(() => {
+        this.dialogTipTimer = null;
+        this.dialogTip = '';
+        this.invalidate();
+      }, 4000);
+    }
+    this.invalidate();
+  }
+
+  private clearDialogTipTimer(): void {
+    const g: any = globalThis as any;
+    if (this.dialogTipTimer !== null) {
+      if (typeof g.clearTimeout === 'function') g.clearTimeout(this.dialogTipTimer);
+      this.dialogTipTimer = null;
+    }
+  }
+
+  private dialogRemoveRect(rowY: number, box: Rect): Rect {
+    return { x: box.x + box.w - 12 - 22, y: rowY - 11, w: 22, h: 22 };
+  }
+
+  /** 弹窗几何：触摸与绘制共用一个纯函数，保证命中区和画出来的位置一致 */
+  private getDialogLayout(dialog: FilterDialogState): DialogLayout {
+    const w = Math.max(220, Math.min(this.size.width - 32, 320));
+    const titleH = 36;
+    const secTitleH = 20;
+    const emptyH = 20;
+    const secGap = 8;
+    const btnH = 28;
+    const tipH = 20;
+
+    const rowCount = (n: number): number =>
+      n ? Math.min(n, DIALOG_MAX_WORDS) + (n > DIALOG_MAX_WORDS ? 1 : 0) : 0;
+    const secH = (n: number): number => secTitleH + (n ? rowCount(n) * DIALOG_ROW_H : emptyH);
+
+    const h =
+      titleH +
+      secH(dialog.include.length) +
+      secGap +
+      secH(dialog.ignore.length) +
+      secGap +
+      btnH +
+      tipH +
+      10;
+    const x = Math.round((this.size.width - w) / 2);
+    const y = Math.round((this.size.height - h) / 2);
+    const box: Rect = { x, y, w, h };
+    const close: Rect = { x: x + w - 8 - 30, y: y + 4, w: 30, h: 26 };
+
+    const rows: DialogRow[] = [];
+    let cursor = y + titleH;
+    const includeTitleY = cursor + secTitleH / 2;
+    cursor += secTitleH;
+    const includeTop = cursor + DIALOG_ROW_H / 2;
+    const includeShown = Math.min(dialog.include.length, DIALOG_MAX_WORDS);
+    for (let i = 0; i < includeShown; i++) {
+      rows.push({ kind: 'include', index: i, word: dialog.include[i], y: includeTop + i * DIALOG_ROW_H });
+    }
+    cursor += dialog.include.length ? rowCount(dialog.include.length) * DIALOG_ROW_H : emptyH;
+
+    cursor += secGap;
+    const ignoreTitleY = cursor + secTitleH / 2;
+    cursor += secTitleH;
+    const ignoreTop = cursor + DIALOG_ROW_H / 2;
+    const ignoreShown = Math.min(dialog.ignore.length, DIALOG_MAX_WORDS);
+    for (let i = 0; i < ignoreShown; i++) {
+      rows.push({ kind: 'ignore', index: i, word: dialog.ignore[i], y: ignoreTop + i * DIALOG_ROW_H });
+    }
+    cursor += dialog.ignore.length ? rowCount(dialog.ignore.length) * DIALOG_ROW_H : emptyH;
+
+    cursor += secGap;
+    const btnW = Math.floor((w - 12 * 2 - 8) / 2);
+    const addInclude: Rect = { x: x + 12, y: cursor, w: btnW, h: btnH };
+    const addIgnore: Rect = { x: x + 12 + btnW + 8, y: cursor, w: btnW, h: btnH };
+    cursor += btnH;
+    const tipY = cursor + 12;
+
+    return { box, close, addInclude, addIgnore, includeTitleY, ignoreTitleY, includeTop, ignoreTop, rows, tipY };
+  }
+
+  private handleDialogTouch(x: number, y: number): void {
+    const dialog = this.filterDialog;
+    if (!dialog) return;
+    const geo = this.getDialogLayout(dialog);
+
+    if (!insideRect(geo.box, x, y) || insideRect(geo.close, x, y)) {
+      this.closeFilterDialog();
+      return;
+    }
+    if (insideRect(geo.addInclude, x, y)) {
+      this.promptAddKeyword('include');
+      return;
+    }
+    if (insideRect(geo.addIgnore, x, y)) {
+      this.promptAddKeyword('ignore');
+      return;
+    }
+    for (let i = 0; i < geo.rows.length; i++) {
+      const row = geo.rows[i];
+      if (insideRect(this.dialogRemoveRect(row.y, geo.box), x, y)) {
+        this.removeKeyword(row.kind, row.index);
+        return;
+      }
+    }
+  }
+
+  private renderFilterDialog(): void {
+    const dialog = this.filterDialog;
+    const ctx = this.ctx;
+    if (!dialog || !ctx) return;
+
+    const geo = this.getDialogLayout(dialog);
+    const left = geo.box.x + 12;
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx.fillRect(0, 0, this.size.width, this.size.height);
+
+    roundRectPath(ctx, geo.box.x, geo.box.y, geo.box.w, geo.box.h, 10);
+    ctx.fillStyle = COLORS.panelBg;
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = COLORS.panelBorder;
+    ctx.stroke();
+
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.font = FONT_BOLD;
+    ctx.fillStyle = COLORS.title;
+    ctx.fillText('日志筛选', left, geo.box.y + 20);
+    this.renderFlatButton(geo.close, '×', '#e0e0e0', 16);
+
+    const sections = [
+      {
+        title: '筛选（只显示命中）',
+        color: COLORS.info,
+        words: dialog.include,
+        titleY: geo.includeTitleY,
+        top: geo.includeTop,
+        empty: '空 · 全部日志都显示',
+      },
+      {
+        title: '排除（整条丢弃 · 存本地）',
+        color: COLORS.error,
+        words: dialog.ignore,
+        titleY: geo.ignoreTitleY,
+        top: geo.ignoreTop,
+        empty: '空 · 所有日志都会记录',
+      },
+    ];
+
+    for (let s = 0; s < sections.length; s++) {
+      const sec = sections[s];
+      ctx.textAlign = 'left';
+      ctx.font = FONT_SMALL;
+      ctx.fillStyle = sec.color;
+      ctx.fillText(sec.title, left, sec.titleY);
+
+      if (!sec.words.length) {
+        ctx.fillStyle = COLORS.dim;
+        ctx.fillText(sec.empty, left + 4, sec.top);
+        continue;
+      }
+
+      const shown = Math.min(sec.words.length, DIALOG_MAX_WORDS);
+      for (let i = 0; i < shown; i++) {
+        const rowY = sec.top + i * DIALOG_ROW_H;
+        roundRectPath(ctx, left, rowY - DIALOG_ROW_H / 2 + 3, geo.box.w - 24, DIALOG_ROW_H - 6, 5);
+        ctx.fillStyle = COLORS.cardBg;
+        ctx.fill();
+
+        ctx.textAlign = 'left';
+        ctx.fillStyle = sec.color;
+        ctx.fillText(this.ellipsis(sec.words[i], geo.box.w - 24 - 32), left + 8, rowY);
+
+        const remove = this.dialogRemoveRect(rowY, geo.box);
+        ctx.textAlign = 'center';
+        ctx.fillStyle = COLORS.dim;
+        ctx.fillText('×', remove.x + remove.w / 2, remove.y + remove.h / 2);
+      }
+
+      if (sec.words.length > DIALOG_MAX_WORDS) {
+        ctx.textAlign = 'left';
+        ctx.fillStyle = COLORS.dim;
+        ctx.fillText(
+          '还有 ' + (sec.words.length - DIALOG_MAX_WORDS) + ' 个，用 API 查看全部',
+          left + 8,
+          sec.top + DIALOG_MAX_WORDS * DIALOG_ROW_H
+        );
+      }
+    }
+
+    this.renderFlatButton(geo.addInclude, '+ 筛选词', COLORS.info);
+    this.renderFlatButton(geo.addIgnore, '+ 排除词', COLORS.error);
+
+    ctx.textAlign = 'left';
+    ctx.font = FONT_SMALL;
+    ctx.fillStyle = this.dialogTip ? COLORS.warn : COLORS.dim;
+    ctx.fillText(this.dialogTip || '排除词会存本地；筛选只影响显示', left, geo.tipY);
   }
 
   private hitButton(x: number, y: number): boolean {
@@ -482,6 +971,9 @@ export class LogPanelView {
 
     const close: Rect = { x: panel.x + panel.w - 8 - 30, y: panel.y + 6, w: 30, h: 28 };
     const clear: Rect = { x: close.x - 8 - 48, y: panel.y + 8, w: 48, h: 24 };
+    // 「筛选」放在「清空」左边；窄屏时先保证标题区还剩 90px
+    const filterW = Math.max(30, Math.min(46, clear.x - 6 - panel.x - 90));
+    const filterBtn: Rect = { x: clear.x - 6 - filterW, y: panel.y + 8, w: filterW, h: 24 };
 
     const chips: ChipHit[] = [];
     // 六个 tab，窄屏时自动缩窄，避免挤出面板
@@ -499,7 +991,7 @@ export class LogPanelView {
       chipX += chipW + chipGap;
     });
 
-    return { panel, header, toolbar, netBar, list, clear, close, chips };
+    return { panel, header, toolbar, netBar, list, filterBtn, clear, close, chips };
   }
 
   private renderButton(): void {
@@ -524,6 +1016,9 @@ export class LogPanelView {
   private renderPanel(): void {
     const ctx = this.ctx;
     const layout = this.getLayout();
+
+    // 标题栏要显示筛选后的条数，先把列表缓存算出来；renderList 会命中同一份
+    if (this.filter !== 'net') this.getListCache(Math.max(40, layout.list.w - 26));
 
     ctx.fillStyle = COLORS.maskBg;
     ctx.fillRect(0, 0, this.size.width, this.size.height);
@@ -560,6 +1055,7 @@ export class LogPanelView {
       ctx.fillText(this.versionLabel, layout.header.x + 12 + titleWidth + 8 + countWidth + 8, titleY + 1);
     }
 
+    this.renderFlatButton(layout.filterBtn, '筛选', '#9ecbff');
     this.renderFlatButton(layout.clear, '清空', '#e0e0e0');
     this.renderFlatButton(layout.close, '×', '#e0e0e0', 16);
 
@@ -589,9 +1085,21 @@ export class LogPanelView {
       const total = this.net.total();
       return pending > 0 ? total + ' · ' + pending + ' 进行中' : String(total);
     }
-    const consoleTotal = this.store.count('all');
-    if (this.filter === 'all') return String(consoleTotal);
-    return this.store.count(this.filter) + '/' + consoleTotal;
+    // 用筛选后的条数：1000 条历史里只有命中的才显示，标题栏要跟着变
+    const cache = this.listCache;
+    const stored = this.store.count('all');
+    const matched = cache ? cache.counts.all : stored;
+    const shown = cache ? cache.entries.length : stored;
+    if (this.filter === 'all') {
+      // 显示上限截断时写成「显示 300 / 命中 1000」，否则容易误以为日志丢了；
+      // 有筛选词时再带上库内总数「命中 111 / 共 1000」，说明历史还在
+      if (shown < matched) return shown + '/' + matched;
+      if (matched < stored) return matched + '/' + stored;
+      return String(stored);
+    }
+    const total = matched;
+    const current = cache ? cache.counts[this.filter] || 0 : this.store.count(this.filter);
+    return current + '/' + total;
   }
 
   /** net tab 顶部状态栏：在线状态 + 网络类型 + 进行中/总数 */
@@ -629,10 +1137,11 @@ export class LogPanelView {
     return '在线 · ' + type.toUpperCase();
   }
 
-  /** 网络状态变化（宿主回调 / 轮询兜底），只在面板打开时触发重绘 */
+  /** 网络状态变化（宿主回调 / 轮询兜底），只在面板打开且状态真的变了才重绘 */
   private applyNetState(state: NetworkState): void {
+    const changed = state.online !== this.netState.online || state.type !== this.netState.type;
     this.netState = state;
-    this.addLog();
+    if (changed) this.onNetChange();
   }
 
   /** 有请求进行中时按固定间隔重绘，让耗时实时跳动 */
@@ -655,6 +1164,12 @@ export class LogPanelView {
       g.clearTimeout(this.tickTimer);
       this.tickTimer = null;
     }
+    if (this.throttleTimer !== null && typeof g.clearTimeout === 'function') {
+      g.clearTimeout(this.throttleTimer);
+      this.throttleTimer = null;
+    }
+    this.clearDialogTipTimer();
+    this.filterDialog = null;
     if (this.netStateTimer) {
       try {
         this.netStateTimer();
@@ -696,6 +1211,7 @@ export class LogPanelView {
     const maxWidth = Math.max(40, listRect.w - 26);
     const cache = this.getListCache(maxWidth);
     const filtered = cache.entries;
+    this.rowHits.length = 0;
 
     if (!filtered.length) {
       ctx.fillStyle = COLORS.dim;
@@ -723,8 +1239,19 @@ export class LogPanelView {
         bottom = top;
         continue;
       }
-      if (filtered[i].runs) this.renderRichRow(filtered[i], cache.runs[i], listRect.x, top, rowHeight);
-      else this.renderRow(filtered[i], cache.lines[i], listRect.x, top, rowHeight);
+      const expanded = this.expandedLogIds.indexOf(filtered[i].id) >= 0;
+      if (cache.expandable[i]) {
+        this.rowHits.push({
+          id: filtered[i].id,
+          rect: { x: listRect.x, y: top, w: listRect.w, h: rowHeight },
+          expandable: true,
+        });
+      }
+      if (filtered[i].runs) {
+        this.renderRichRow(filtered[i], cache.runs[i], listRect.x, top, rowHeight, cache.expandable[i], expanded);
+      } else {
+        this.renderRow(filtered[i], cache.lines[i], listRect.x, top, rowHeight, cache.expandable[i], expanded);
+      }
       bottom = top;
       if (top < topEdge) break;
     }
@@ -738,46 +1265,87 @@ export class LogPanelView {
    * 拖动滚动条时不再重复分配这些数组。
    */
   private getListCache(maxWidth: number): ListCache {
+    const expandedKey = this.expandedLogIds.join(',');
     const cache = this.listCache;
     if (
       cache &&
       cache.version === this.store.version &&
       cache.filter === this.filter &&
-      cache.width === maxWidth
+      cache.width === maxWidth &&
+      cache.expandedKey === expandedKey
     ) {
       return cache;
     }
 
     const entries = this.store.list();
+    // 被上限淘汰掉的旧日志不再保留展开状态
+    const oldest = entries.length ? entries[0].id : 0;
+    for (let i = this.expandedLogIds.length - 1; i >= 0; i--) {
+      if (this.expandedLogIds[i] < oldest) this.expandedLogIds.splice(i, 1);
+    }
+
     const filtered: LogEntry[] = [];
     const heights: number[] = [];
     const lines: string[][] = [];
     const runs: RunLine[][] = [];
-    let contentHeight = 0;
+    const expandable: boolean[] = [];
+    const counts: Record<string, number> = { all: 0, log: 0, info: 0, warn: 0, error: 0 };
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
+      // 筛选作用在展示层：内存里 1000 条全部保留，靠筛选词往回翻历史
+      if (!this.store.matchesInclude(entry)) continue;
+      counts.all++;
+      counts[entry.level] = (counts[entry.level] || 0) + 1;
       if (!matchesFilter(entry, this.filter)) continue;
+
+      const expanded = this.expandedLogIds.indexOf(entry.id) >= 0;
 
       filtered.push(entry);
       if (entry.runs) {
-        const runLines = this.layoutRuns(entry, maxWidth);
+        const runLines = this.layoutRuns(entry, maxWidth, expanded);
+        const canExpand = expanded ? runLines.length > COLLAPSED_LINES : !!entry.runWrapCache?.more;
         runs.push(runLines);
         lines.push([]);
-        const height = runLines.length * LINE_HEIGHT + ROW_GAP;
-        heights.push(height);
-        contentHeight += height;
+        heights.push(runLines.length * LINE_HEIGHT + ROW_GAP + (canExpand ? EXPAND_HINT_H : 0));
+        expandable.push(canExpand);
       } else {
-        const wrapped = this.wrapEntry(entry, maxWidth);
+        const wrapped = this.wrapEntry(entry, maxWidth, expanded);
+        const canExpand = expanded ? wrapped.length > COLLAPSED_LINES : !!entry.wrapCache?.more;
         lines.push(wrapped);
         runs.push([]);
-        const height = wrapped.length * LINE_HEIGHT + ROW_GAP;
-        heights.push(height);
-        contentHeight += height;
+        heights.push(wrapped.length * LINE_HEIGHT + ROW_GAP + (canExpand ? EXPAND_HINT_H : 0));
+        expandable.push(canExpand);
       }
     }
 
-    this.listCache = { version: this.store.version, filter: this.filter, width: maxWidth, entries: filtered, heights, lines, runs, contentHeight };
+    // 显示上限：只往回画最近 N 条，更早的历史留在内存里，靠筛选词才能看到
+    const limit = this.store.displayLimit;
+    if (limit > 0 && filtered.length > limit) {
+      const overflow = filtered.length - limit;
+      filtered.splice(0, overflow);
+      heights.splice(0, overflow);
+      lines.splice(0, overflow);
+      runs.splice(0, overflow);
+      expandable.splice(0, overflow);
+    }
+
+    let contentHeight = 0;
+    for (let i = 0; i < heights.length; i++) contentHeight += heights[i];
+
+    this.listCache = {
+      version: this.store.version,
+      filter: this.filter,
+      width: maxWidth,
+      expandedKey,
+      entries: filtered,
+      heights,
+      lines,
+      runs,
+      expandable,
+      counts,
+      contentHeight,
+    };
     return this.listCache;
   }
 
@@ -1042,7 +1610,15 @@ export class LogPanelView {
     }
   }
 
-  private renderRow(entry: LogEntry, lines: string[], listX: number, top: number, height: number): void {
+  private renderRow(
+    entry: LogEntry,
+    lines: string[],
+    listX: number,
+    top: number,
+    height: number,
+    expandable: boolean,
+    expanded: boolean
+  ): void {
     const ctx = this.ctx;
     const color = levelColor(entry.level);
 
@@ -1055,10 +1631,33 @@ export class LogPanelView {
     for (let i = 0; i < lines.length; i++) {
       ctx.fillText(lines[i], listX + 16, top + 3 + i * LINE_HEIGHT);
     }
+
+    if (expandable) this.renderExpandHint(top, lines.length, expanded);
+  }
+
+  /** 可展开的行在最后一行下面留一条窄带标出「展开 / 收起」，不压正文 */
+  private renderExpandHint(top: number, lineCount: number, expanded: boolean): void {
+    const ctx = this.ctx;
+    const listRect = this.layout ? this.layout.list : null;
+    if (!listRect) return;
+    ctx.font = FONT_SMALL;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = COLORS.dim;
+    ctx.fillText(expanded ? '收起' : '展开全文', listRect.x + 16, top + 2 + lineCount * LINE_HEIGHT);
+    ctx.font = FONT;
   }
 
   /** 富文本渲染：带 %c 样式的日志走这条路径，先铺背景再画文字 */
-  private renderRichRow(entry: LogEntry, lines: RunLine[], listX: number, top: number, height: number): void {
+  private renderRichRow(
+    entry: LogEntry,
+    lines: RunLine[],
+    listX: number,
+    top: number,
+    height: number,
+    expandable: boolean,
+    expanded: boolean
+  ): void {
     const ctx = this.ctx;
 
     ctx.fillStyle = levelColor(entry.level);
@@ -1105,16 +1704,19 @@ export class LogPanelView {
     }
 
     ctx.font = FONT;
+    if (expandable) this.renderExpandHint(top, lines.length, expanded);
   }
 
   /**
    * 富文本换行：按字符累加宽度，样式切换或超宽时切段/换行。
    * 时间前缀作为无样式的一段拼在最前面，结果缓存在 entry 上。
    */
-  private layoutRuns(entry: LogEntry, maxWidth: number): RunLine[] {
+  private layoutRuns(entry: LogEntry, maxWidth: number, expanded: boolean): RunLine[] {
     const cache = entry.runWrapCache;
-    if (cache && cache.width === maxWidth) return cache.lines as RunLine[];
+    if (cache && cache.width === maxWidth && !!cache.expanded === expanded) return cache.lines as RunLine[];
 
+    // 收起时多算一行用于判断「是否还有更多」
+    const limit = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES + 1;
     const ctx = this.ctx;
     const runs = entry.runs || [];
     const lines: RunLine[] = [{ pieces: [] }];
@@ -1147,7 +1749,7 @@ export class LogPanelView {
       ctx.font = style && style.bold ? FONT_RUN_BOLD : FONT;
 
       for (let i = 0; i < text.length; i++) {
-        if (lines.length > MAX_LINES_PER_ENTRY) return;
+        if (lines.length > limit) return;
         const ch = text.charAt(i);
         if (ch === '\n') {
           newLine();
@@ -1177,29 +1779,45 @@ export class LogPanelView {
     while (lines.length && !lines[lines.length - 1].pieces.length) lines.pop();
     ctx.font = FONT;
 
-    entry.runWrapCache = { width: maxWidth, lines };
+    // 超出可见行数就截断，并在最后一行补一个省略号片段
+    const visible = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES;
+    const more = lines.length > visible;
+    if (more) {
+      lines.length = visible;
+      const last = lines[visible - 1];
+      const tail = last.pieces[last.pieces.length - 1];
+      const tailX = tail ? tail.x + tail.padX * 2 + tail.w : 0;
+      last.pieces.push({ text: ' …', x: tailX, w: 0, padX: 0 });
+    }
+
+    entry.runWrapCache = { width: maxWidth, expanded, more, lines };
     return lines;
   }
 
   /** 按面板宽度换行，结果缓存在 entry 上，日志不变就不重复测量 */
-  private wrapEntry(entry: LogEntry, maxWidth: number): string[] {
+  private wrapEntry(entry: LogEntry, maxWidth: number, expanded: boolean): string[] {
     const cache = entry.wrapCache;
-    if (cache && cache.width === maxWidth) return cache.lines;
+    if (cache && cache.width === maxWidth && !!cache.expanded === expanded) return cache.lines;
 
+    // 收起时只要判断「是否还有更多」，多量一行就够，不必量满 40 行
+    const limit = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES + 1;
     const ctx = this.ctx;
     const content = '[' + entry.time + '] ' + entry.text;
     const lines: string[] = [];
     const paragraphs = content.split('\n');
+    let more = false;
 
     ctx.font = FONT;
-    for (let p = 0; p < paragraphs.length; p++) {
+    for (let p = 0; p < paragraphs.length && !more; p++) {
       const paragraph = paragraphs[p];
       if (!paragraph) {
         lines.push('');
+        if (lines.length >= limit) more = true;
         continue;
       }
       if (ctx.measureText(paragraph).width <= maxWidth) {
         lines.push(paragraph);
+        if (lines.length >= limit) more = true;
         continue;
       }
       let line = '';
@@ -1208,21 +1826,32 @@ export class LogPanelView {
         if (line && ctx.measureText(next).width > maxWidth) {
           lines.push(line);
           line = paragraph[i];
-          if (lines.length >= MAX_LINES_PER_ENTRY) break;
+          if (lines.length >= limit) {
+            more = true;
+            break;
+          }
         } else {
           line = next;
         }
       }
-      if (lines.length >= MAX_LINES_PER_ENTRY) break;
-      if (line) lines.push(line);
+      if (more) break;
+      if (line) {
+        lines.push(line);
+        if (lines.length >= limit) more = true;
+      }
     }
 
-    if (lines.length >= MAX_LINES_PER_ENTRY) {
+    if (!expanded) {
+      if (more) {
+        lines.length = COLLAPSED_LINES;
+        lines[COLLAPSED_LINES - 1] = lines[COLLAPSED_LINES - 1] + ' …';
+      }
+    } else if (lines.length >= MAX_LINES_PER_ENTRY) {
       lines.length = MAX_LINES_PER_ENTRY;
       lines[MAX_LINES_PER_ENTRY - 1] = lines[MAX_LINES_PER_ENTRY - 1] + ' …';
     }
 
-    entry.wrapCache = { width: maxWidth, lines };
+    entry.wrapCache = { width: maxWidth, expanded, more, lines };
     return lines;
   }
 }

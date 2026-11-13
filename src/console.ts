@@ -32,10 +32,10 @@ export interface LogEntry {
   text: string;
   /** 用了 %c 的日志才有：按样式切好的文本段 */
   runs?: TextRun[];
-  /** 按面板宽度缓存的换行结果，避免每帧重复 measureText */
-  wrapCache?: { width: number; lines: string[] };
+  /** 换行缓存：expanded 表示这份结果是展开态（收起态只算到第 5 行），more 表示内容还有剩 */
+  wrapCache?: { width: number; lines: string[]; expanded?: boolean; more?: boolean };
   /** 富文本换行结果缓存（结构由 ui 层决定） */
-  runWrapCache?: { width: number; lines: any[] };
+  runWrapCache?: { width: number; lines: any[]; expanded?: boolean; more?: boolean };
 }
 
 export type LogStoreListener = () => void;
@@ -450,12 +450,17 @@ export class LogStore {
   private counts: Record<string, number> = { log: 0, info: 0, warn: 0, error: 0 };
   /** 排除词：命中的日志整条丢弃，被丢弃的不占条数上限 */
   private keywords: string[] = DEFAULT_IGNORE_KEYWORDS.slice();
-  /** 筛选词：非空时只保留命中的日志，同样不占条数上限 */
+  /** 筛选词：非空时只显示命中的日志，作用在展示层，能翻到已存下的历史 */
   private includeWords: string[] = [];
 
+  /** 内存里最多留多少条 */
   maxLogs: number;
+  /** 面板最多往回显示多少条（按筛选后的结果从新往旧数） */
+  displayLimit = 300;
   /** 内容版本号，UI 靠它判断能否复用上一帧的过滤/换行结果 */
   version = 0;
+  /** 排除词变化后的回调（用于写本地存储），null 表示不持久化 */
+  onIgnoreKeywordsChange: ((words: string[]) => void) | null = null;
 
   constructor(maxLogs: number) {
     this.maxLogs = maxLogs;
@@ -464,25 +469,41 @@ export class LogStore {
   /** 整体替换过滤词，传空数组表示不再过滤任何日志 */
   setIgnoreKeywords(words: string[]): void {
     this.keywords = normalizeKeywords(words || []);
+    this.notifyIgnoreKeywords();
   }
 
   addIgnoreKeywords(words: string[]): void {
     if (!words || !words.length) return;
     this.keywords = normalizeKeywords(this.keywords.concat(words));
+    this.notifyIgnoreKeywords();
+  }
+
+  private notifyIgnoreKeywords(): void {
+    const handler = this.onIgnoreKeywordsChange;
+    if (!handler) return;
+    try {
+      handler(this.keywords.slice());
+    } catch (e) {
+      // 存不进去不影响当前会话的过滤
+    }
   }
 
   ignoreKeywords(): string[] {
     return this.keywords.slice();
   }
 
-  /** 整体替换筛选词，传空数组表示不筛选（所有未命中的排除词的日志都保留） */
+  /** 整体替换筛选词，传空数组表示不筛选；改动只影响展示，历史日志立刻跟着变 */
   setIncludeKeywords(words: string[]): void {
     this.includeWords = normalizeKeywords(words || []);
+    this.version++;
+    this.emit();
   }
 
   addIncludeKeywords(words: string[]): void {
     if (!words || !words.length) return;
     this.includeWords = normalizeKeywords(this.includeWords.concat(words));
+    this.version++;
+    this.emit();
   }
 
   includeKeywords(): string[] {
@@ -512,28 +533,24 @@ export class LogStore {
     return false;
   }
 
-  /** 没有筛选词时全部通过；有筛选词时先扫原始参数 */
-  shouldInclude(args: any[]): boolean {
+  /** 没有筛选词时全部通过；有筛选词时看已格式化文本（含时间前缀）是否命中 */
+  matchesInclude(entry: LogEntry): boolean {
     const words = this.includeWords;
     if (!words.length) return true;
-    for (let i = 0; i < args.length; i++) {
-      const arg = args[i];
-      if (typeof arg !== 'string' || !arg) continue;
-      for (let k = 0; k < words.length; k++) {
-        if (arg.indexOf(words[k]) >= 0) return true;
-      }
-    }
-    return false;
-  }
-
-  /** 筛选词也可能只出现在对象字段里，格式化结果再兜一次 */
-  isIncludedText(text: string): boolean {
-    const words = this.includeWords;
-    if (!words.length) return true;
+    const text = entry.text;
     for (let k = 0; k < words.length; k++) {
       if (text.indexOf(words[k]) >= 0) return true;
     }
     return false;
+  }
+
+  /** 运行时调整显示条数（只影响渲染，不影响内存里保留的历史） */
+  setDisplayLimit(limit: number): void {
+    const next = limit > 0 ? Math.floor(limit) : 0;
+    if (next === this.displayLimit) return;
+    this.displayLimit = next;
+    this.version++;
+    this.emit();
   }
 
   /** 运行时调整上限，超出部分立即丢弃最旧的 */
@@ -638,10 +655,10 @@ export function interceptConsole(store: LogStore): ConsolePatch {
       if (!store.shouldIgnore(args)) {
         try {
           const formatted = formatConsoleArgs(args);
-          // 排除优先：先看格式化文本是否命中排除词，再看是否命中筛选词
-          const keep = !store.isIgnoredText(formatted.text)
-            && (store.shouldInclude(args) || store.isIncludedText(formatted.text));
-          if (keep) store.push(item.level, formatted.text, formatted.runs);
+          // 只判排除词；筛选词在展示层生效，这样能翻到筛选之前已经存下的历史
+          if (!store.isIgnoredText(formatted.text)) {
+            store.push(item.level, formatted.text, formatted.runs);
+          }
         } catch (e) {
           // 格式化失败也要保证原始日志照常输出
         }
