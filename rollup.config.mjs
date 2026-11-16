@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import typescript from '@rollup/plugin-typescript';
+import terser from '@rollup/plugin-terser';
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'));
 
@@ -26,5 +27,34 @@ export default {
     exports: 'default',
     banner,
   },
-  plugins: [typescript({ tsconfig: './tsconfig.json' }), injectVersion()],
+  plugins: [
+    typescript({ tsconfig: './tsconfig.json' }),
+    injectVersion(),
+    // 压缩 + 混淆标识符：产物变小，同时让堆栈里的内部变量名失去可读性。
+    // 注意不能开 drop_console：面板本身要靠输出 console 日志来工作
+    terser({
+      ecma: 2015,
+      compress: {
+        ecma: 2015,
+        passes: 3,
+        booleans_as_integers: false,
+        drop_debugger: true,
+        // 关掉这些会改变语义或吞掉日志的选项
+        drop_console: false,
+        unsafe: false,
+        unsafe_arrows: false,
+        unsafe_methods: false,
+      },
+      mangle: {
+        toplevel: true,
+        // 属性名不动：面板要读写宿主对象（my.*、canvas、ctx）
+        properties: false,
+      },
+      format: {
+        ecma: 2015,
+        // 只保留 banner 这种 /*! ... */ 注释
+        comments: /^!/,
+      },
+    }),
+  ],
 };

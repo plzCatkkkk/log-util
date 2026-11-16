@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 面板视图：全部用 Canvas 2D 绘制（支付宝小游戏没有 DOM），
  * 命中检测自己算，触摸由 env.bindTouch 统一喂进来。
  */
@@ -7,21 +7,49 @@ import type { LogEntry, LogFilter, LogLevel, LogStore, TextStyle } from './conso
 import { bindNetworkState, getMyApi, resizeCanvas } from './env';
 import type { NetworkState, ScreenSize } from './env';
 import type { NetRecord, NetStore } from './network';
+import { DEFAULT_SETTINGS, nextSettingValue, saveSettings, settingValueText } from './settings';
+import type { PanelSettings } from './settings';
 
 type Rect = { x: number; y: number; w: number; h: number };
 
-const FONT = '12px sans-serif';
-const FONT_BOLD = 'bold 13px sans-serif';
+/**
+ * 字号相关的几个值由设置面板改写，所以是 let 而不是 const。
+ * 全部绘制都在同一个模块里同步完成，改完立即生效。
+ */
+let FONT = '12px sans-serif';
+let FONT_BOLD = 'bold 13px sans-serif';
 /** 富文本里加粗用同字号，避免行高对不齐 */
-const FONT_RUN_BOLD = 'bold 12px sans-serif';
-const FONT_SMALL = '11px sans-serif';
-const LINE_HEIGHT = 17;
+let FONT_RUN_BOLD = 'bold 12px sans-serif';
+let FONT_SMALL = '11px sans-serif';
+let LINE_HEIGHT = 17;
+/** 可展开的行在正文下面留出的「展开全文」提示带高度 */
+let EXPAND_HINT_H = 15;
 const ROW_GAP = 6;
 const MAX_LINES_PER_ENTRY = 40;
-/** 收起状态下每条日志最多显示几行，点开才展开到 MAX_LINES_PER_ENTRY */
-const COLLAPSED_LINES = 4;
-/** 可展开的行在正文下面留出的「展开全文」提示带高度 */
-const EXPAND_HINT_H = 15;
+/** 收起状态下每条日志最多显示几行（0 = 不折叠），由设置面板切换 */
+let collapsedLines = DEFAULT_SETTINGS.collapsedLines;
+/** 是否在每条日志前面画时间戳 */
+let showTime = DEFAULT_SETTINGS.showTime;
+/** 滚上去看旧日志时，新日志到达是否保持当前查看位置 */
+let followTail = DEFAULT_SETTINGS.followTail;
+
+/** 收起态实际可见行数：设成 0 表示不折叠 */
+function visibleLines(expanded: boolean): number {
+  if (expanded) return MAX_LINES_PER_ENTRY;
+  return collapsedLines > 0 ? Math.min(collapsedLines, MAX_LINES_PER_ENTRY) : MAX_LINES_PER_ENTRY;
+}
+
+/** 把设置里的字号换算成绘图用的字体与行高 */
+function applyFontSize(fontSize: number): void {
+  const size = fontSize > 0 ? fontSize : DEFAULT_SETTINGS.fontSize;
+  const ratio = size / DEFAULT_SETTINGS.fontSize;
+  FONT = size + 'px sans-serif';
+  FONT_RUN_BOLD = 'bold ' + size + 'px sans-serif';
+  FONT_BOLD = 'bold ' + Math.round(13 * ratio) + 'px sans-serif';
+  FONT_SMALL = Math.max(10, Math.round(11 * ratio)) + 'px sans-serif';
+  LINE_HEIGHT = Math.round(17 * ratio);
+  EXPAND_HINT_H = Math.max(13, Math.round(15 * ratio));
+}
 
 /** 网络卡片：行高、卡片间距、上下内边距 */
 const NET_LINE_HEIGHT = 15;
@@ -38,10 +66,16 @@ const NET_TICK_INTERVAL = 400;
  */
 const LOG_FRAME_GAP = 50;
 
-/** 筛选弹窗每段最多列出多少个词，超出的给一行提示 */
+/** 设置弹窗每段最多列出多少个词，超出的给一行提示 */
 const DIALOG_MAX_WORDS = 6;
-/** 筛选弹窗里一行关键词的高度 */
+/** 设置弹窗里一行关键词的高度 */
 const DIALOG_ROW_H = 26;
+/** 设置弹窗里一行设置项的高度 */
+const DIALOG_SETTING_H = 30;
+/** 设置弹窗顶部那一排小 tab 的高度 */
+const DIALOG_TAB_H = 30;
+/** 设置项右侧取值胶囊的宽度 */
+const DIALOG_VALUE_W = 62;
 
 const COLORS = {
   maskBg: 'rgba(0, 0, 0, 0.38)',
@@ -84,6 +118,10 @@ export interface LogPanelViewOptions {
   onFrame?: () => void;
   /** 面板打开 / 收起回调，用于控制触摸穿透 */
   onOpenChange?: (open: boolean) => void;
+  /** 当前生效的设置（一般由 index 从本地存储读出来传进来） */
+  settings?: PanelSettings;
+  /** 设置被改动后回调，容量类设置需要 index 帮忙应用到底层仓库 */
+  onSettingsChange?: (settings: PanelSettings) => void;
 }
 
 interface ChipHit {
@@ -99,14 +137,38 @@ interface Layout {
   /** net tab 的网络状态条，其他 tab 高度为 0 */
   netBar: Rect;
   list: Rect;
-  /** 标题栏左侧的「筛选」按钮，打开筛选词弹窗 */
+  /** 标题栏左侧的「设置」按钮，打开设置弹窗 */
   filterBtn: Rect;
   clear: Rect;
   close: Rect;
   chips: ChipHit[];
 }
 
-/** 筛选弹窗里一行关键词（含右侧删除按钮） */
+/** 设置弹窗里的三个分页：显示 / 容量 / 词表 */
+type DialogTab = 'view' | 'capacity' | 'words';
+
+const DIALOG_TABS: Array<{ tab: DialogTab; label: string }> = [
+  { tab: 'view', label: '显示' },
+  { tab: 'capacity', label: '容量' },
+  { tab: 'words', label: '词表' },
+];
+
+/** 两个设置页的行定义，点整行循环切换取值 */
+const VIEW_ROWS: Array<{ key: keyof PanelSettings; label: string }> = [
+  { key: 'collapsedLines', label: '收起行数' },
+  { key: 'fontSize', label: '字号' },
+  { key: 'showTime', label: '时间戳' },
+  { key: 'followTail', label: '跟随最新' },
+];
+
+const CAPACITY_ROWS: Array<{ key: keyof PanelSettings; label: string }> = [
+  { key: 'maxLogs', label: '内存上限' },
+  { key: 'displayLimit', label: '显示上限' },
+  { key: 'maxNetRecords', label: '网络记录' },
+  { key: 'maxPixelRatio', label: '像素比' },
+];
+
+/** 设置弹窗里一行关键词（含右侧删除按钮） */
 interface DialogRow {
   kind: 'include' | 'ignore';
   index: number;
@@ -114,9 +176,26 @@ interface DialogRow {
   y: number;
 }
 
+/** 设置弹窗里一行设置项，整行都是命中区 */
+interface DialogSettingRow {
+  key: keyof PanelSettings;
+  label: string;
+  value: string;
+  y: number;
+  rect: Rect;
+}
+
+interface DialogTabHit {
+  tab: DialogTab;
+  label: string;
+  rect: Rect;
+}
+
 interface DialogLayout {
   box: Rect;
   close: Rect;
+  tabs: DialogTabHit[];
+  settings: DialogSettingRow[];
   addInclude: Rect;
   addIgnore: Rect;
   includeTitleY: number;
@@ -128,8 +207,9 @@ interface DialogLayout {
   tipY: number;
 }
 
-/** 筛选弹窗的内存状态：改动先在本地累积，每次增删立即回写到 store */
-interface FilterDialogState {
+/** 设置弹窗的内存状态：词表改动立即回写 store，tab 只影响弹窗自己 */
+interface SettingsDialogState {
+  tab: DialogTab;
   include: string[];
   ignore: string[];
 }
@@ -260,11 +340,17 @@ export class LogPanelView {
   /** 限速等待中的定时器；交互来了可以提前取消 */
   private throttleTimer: any = null;
 
-  /** 筛选词弹窗，null 表示未打开 */
-  private filterDialog: FilterDialogState | null = null;
+  /** 设置弹窗，null 表示未打开 */
+  private settingsDialog: SettingsDialogState | null = null;
   /** 弹窗底部的一行提示（比如当前环境不支持输入） */
   private dialogTip = '';
   private dialogTipTimer: any = null;
+
+  /** 当前生效的设置，容量项改动会通过 onSettingsChange 交给 index 应用 */
+  private settings: PanelSettings;
+  private onSettingsChange?: (settings: PanelSettings) => void;
+  /** 上一帧的列表总高度，用来在「不跟随最新」时补偿新日志带来的位移 */
+  private lastContentHeight = 0;
 
   private button: { x: number; y: number; r: number };
   private layout: Layout | null = null;
@@ -288,7 +374,15 @@ export class LogPanelView {
     this.ctx = canvas && typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null;
     this.onFrame = options.onFrame;
     this.onOpenChange = options.onOpenChange;
+    this.onSettingsChange = options.onSettingsChange;
     this.versionLabel = options.version ? 'v' + options.version : '';
+
+    // 设置先落到模块级的绘制参数上，后面所有测量 / 绘制都按这套字号和行数走
+    this.settings = { ...(options.settings || DEFAULT_SETTINGS) };
+    applyFontSize(this.settings.fontSize);
+    collapsedLines = this.settings.collapsedLines;
+    showTime = this.settings.showTime;
+    followTail = this.settings.followTail;
 
     const radius = options.buttonRadius && options.buttonRadius > 0 ? options.buttonRadius : 22;
     const defaultX = size.width - radius - 12;
@@ -318,6 +412,12 @@ export class LogPanelView {
     this.invalidate();
   }
 
+  /** 外部（LogPanel.setMaxLogs 等 API）改了设置后同步进来，弹窗里的取值才不会过期 */
+  syncSettings(next: PanelSettings): void {
+    this.applySettings(next);
+    this.invalidate();
+  }
+
   isOpen(): boolean {
     return this.visible;
   }
@@ -335,7 +435,7 @@ export class LogPanelView {
     if (!this.visible) return;
     this.visible = false;
     this.touchMode = 'none';
-    this.filterDialog = null;
+    this.settingsDialog = null;
     this.dialogTip = '';
     this.clearDialogTipTimer();
     if (this.onOpenChange) this.onOpenChange(false);
@@ -432,7 +532,7 @@ export class LogPanelView {
 
     if (this.visible) this.renderPanel();
     else this.renderButton();
-    if (this.visible && this.filterDialog) this.renderFilterDialog();
+    if (this.visible && this.settingsDialog) this.renderSettingsDialog();
 
     // 滚动位置在绘制里可能被夹紧，按夹紧后的状态记录，避免下一帧白画一次
     this.frameKey = this.frameKeyOf();
@@ -466,15 +566,36 @@ export class LogPanelView {
       key += '|' + (this.expandedNetId === null ? '' : this.expandedNetId);
       // 日志行的展开状态会影响行高和内容，必须进签名
       if (this.expandedLogIds.length) key += '|e' + this.expandedLogIds.join(',');
-      if (this.filterDialog) {
+      if (this.settingsDialog) {
         key +=
           '|d' +
-          this.filterDialog.include.join(',') +
+          this.settingsDialog.tab +
           ';' +
-          this.filterDialog.ignore.join(',') +
+          this.settingsDialog.include.join(',') +
+          ';' +
+          this.settingsDialog.ignore.join(',') +
           ';' +
           this.dialogTip;
       }
+      // 设置直接影响排版和取值显示，任一改动都要重画
+      const s = this.settings;
+      key +=
+        '|s' +
+        s.collapsedLines +
+        ',' +
+        s.fontSize +
+        ',' +
+        (s.showTime ? 1 : 0) +
+        ',' +
+        (s.followTail ? 1 : 0) +
+        ',' +
+        s.maxLogs +
+        ',' +
+        s.displayLimit +
+        ',' +
+        s.maxNetRecords +
+        ',' +
+        s.maxPixelRatio;
     } else {
       // 收起态只画悬浮按钮，位置变了才需要重画
       key += '|' + this.button.x + ',' + this.button.y + ',' + this.button.r;
@@ -500,7 +621,7 @@ export class LogPanelView {
       if (!layout) return false;
 
       // 筛选词弹窗在最上层：打开时所有触摸都归它，点弹窗外即关闭
-      if (this.filterDialog) {
+      if (this.settingsDialog) {
         this.touchMode = 'consumed';
         this.handleDialogTouch(x, y);
         return true;
@@ -519,7 +640,7 @@ export class LogPanelView {
         return true;
       }
       if (insideRect(layout.filterBtn, x, y)) {
-        this.openFilterDialog();
+        this.openSettingsDialog();
         this.touchMode = 'consumed';
         return true;
       }
@@ -639,9 +760,10 @@ export class LogPanelView {
     this.invalidate();
   }
 
-  /** 打开筛选词弹窗：把 store 里当前生效的筛选词/排除词取一份快照来编辑 */
-  private openFilterDialog(): void {
-    this.filterDialog = {
+  /** 打开设置弹窗：词表取 store 的当前快照，容量 / 显示项直接读设置 */
+  private openSettingsDialog(): void {
+    this.settingsDialog = {
+      tab: 'view',
       include: this.store.includeKeywords(),
       ignore: this.store.ignoreKeywords(),
     };
@@ -650,8 +772,8 @@ export class LogPanelView {
     this.invalidate();
   }
 
-  private closeFilterDialog(): void {
-    this.filterDialog = null;
+  private closeSettingsDialog(): void {
+    this.settingsDialog = null;
     this.dialogTip = '';
     this.clearDialogTipTimer();
     this.invalidate();
@@ -659,15 +781,56 @@ export class LogPanelView {
 
   /** 弹窗里的增删立即回写 store；注意只影响之后的新日志，历史日志需要清空 */
   private applyDialogKeywords(): void {
-    const dialog = this.filterDialog;
+    const dialog = this.settingsDialog;
     if (!dialog) return;
     this.store.setIncludeKeywords(dialog.include);
     this.store.setIgnoreKeywords(dialog.ignore);
     this.invalidate();
   }
 
+  /** 点一行设置就切到下一个可选值，改完立即落盘并生效 */
+  private cycleSetting(key: keyof PanelSettings): void {
+    const next = { ...this.settings };
+    (next as any)[key] = nextSettingValue(this.settings, key);
+    this.commitSettings(next);
+  }
+
+  /** 保存 + 应用；容量类设置由 index 通过 onSettingsChange 应用到底层仓库 */
+  private commitSettings(next: PanelSettings): void {
+    saveSettings(next);
+    this.applySettings(next);
+    this.invalidate();
+  }
+
+  private applySettings(next: PanelSettings): void {
+    const prev = this.settings;
+    this.settings = next;
+
+    applyFontSize(next.fontSize);
+    collapsedLines = next.collapsedLines;
+    showTime = next.showTime;
+    followTail = next.followTail;
+
+    // 换行结果是按「宽度 + 字号 + 收起行数 + 有没有时间戳」算出来的，这几项变了就得全部作废
+    if (prev.fontSize !== next.fontSize || prev.collapsedLines !== next.collapsedLines || prev.showTime !== next.showTime) {
+      this.dropWrapCaches();
+      this.listCache = null;
+      this.lastContentHeight = 0;
+    }
+
+    if (this.onSettingsChange) this.onSettingsChange(next);
+  }
+
+  private dropWrapCaches(): void {
+    const entries = this.store.list();
+    for (let i = 0; i < entries.length; i++) {
+      entries[i].wrapCache = undefined;
+      entries[i].runWrapCache = undefined;
+    }
+  }
+
   private removeKeyword(kind: 'include' | 'ignore', index: number): void {
-    const dialog = this.filterDialog;
+    const dialog = this.settingsDialog;
     if (!dialog) return;
     const words = kind === 'include' ? dialog.include : dialog.ignore;
     if (index < 0 || index >= words.length) return;
@@ -677,7 +840,7 @@ export class LogPanelView {
 
   /** 新增关键词：小游戏里没有 DOM 输入框，走宿主的 my.prompt */
   private promptAddKeyword(kind: 'include' | 'ignore'): void {
-    const dialog = this.filterDialog;
+    const dialog = this.settingsDialog;
     if (!dialog) return;
 
     const my = getMyApi();
@@ -692,7 +855,7 @@ export class LogPanelView {
       placeholder: '例如 [BATTLE]',
       success: (res: any) => {
         // 输入期间弹窗被关掉就丢弃这次输入
-        if (this.filterDialog !== dialog) return;
+        if (this.settingsDialog !== dialog) return;
         if (!res || !res.ok) return;
         const word = String(res.inputValue === undefined ? '' : res.inputValue).trim();
         if (!word) return;
@@ -735,73 +898,142 @@ export class LogPanelView {
   }
 
   /** 弹窗几何：触摸与绘制共用一个纯函数，保证命中区和画出来的位置一致 */
-  private getDialogLayout(dialog: FilterDialogState): DialogLayout {
+  private getDialogLayout(dialog: SettingsDialogState): DialogLayout {
     const w = Math.max(220, Math.min(this.size.width - 32, 320));
     const titleH = 36;
     const secTitleH = 20;
     const emptyH = 20;
     const secGap = 8;
     const btnH = 28;
-    const tipH = 20;
+    const tipH = 22;
 
     const rowCount = (n: number): number =>
       n ? Math.min(n, DIALOG_MAX_WORDS) + (n > DIALOG_MAX_WORDS ? 1 : 0) : 0;
     const secH = (n: number): number => secTitleH + (n ? rowCount(n) * DIALOG_ROW_H : emptyH);
 
-    const h =
-      titleH +
-      secH(dialog.include.length) +
-      secGap +
-      secH(dialog.ignore.length) +
-      secGap +
-      btnH +
-      tipH +
-      10;
+    const settingRows = dialog.tab === 'capacity' ? CAPACITY_ROWS : VIEW_ROWS;
+    const contentH =
+      dialog.tab === 'words'
+        ? secH(dialog.include.length) + secGap + secH(dialog.ignore.length) + secGap + btnH
+        : settingRows.length * DIALOG_SETTING_H + 6;
+
+    const h = titleH + DIALOG_TAB_H + contentH + tipH;
     const x = Math.round((this.size.width - w) / 2);
     const y = Math.round((this.size.height - h) / 2);
     const box: Rect = { x, y, w, h };
     const close: Rect = { x: x + w - 8 - 30, y: y + 4, w: 30, h: 26 };
 
+    // 标题下面那排小 tab
+    const tabs: DialogTabHit[] = [];
+    const tabInset = 12;
+    const tabGap = 6;
+    const tabW = Math.floor((w - tabInset * 2 - tabGap * 2) / 3);
+    for (let i = 0; i < DIALOG_TABS.length; i++) {
+      tabs.push({
+        tab: DIALOG_TABS[i].tab,
+        label: DIALOG_TABS[i].label,
+        rect: {
+          x: x + tabInset + i * (tabW + tabGap),
+          y: y + titleH,
+          w: tabW,
+          h: DIALOG_TAB_H - 8,
+        },
+      });
+    }
+
+    const settings: DialogSettingRow[] = [];
     const rows: DialogRow[] = [];
-    let cursor = y + titleH;
-    const includeTitleY = cursor + secTitleH / 2;
-    cursor += secTitleH;
-    const includeTop = cursor + DIALOG_ROW_H / 2;
-    const includeShown = Math.min(dialog.include.length, DIALOG_MAX_WORDS);
-    for (let i = 0; i < includeShown; i++) {
-      rows.push({ kind: 'include', index: i, word: dialog.include[i], y: includeTop + i * DIALOG_ROW_H });
-    }
-    cursor += dialog.include.length ? rowCount(dialog.include.length) * DIALOG_ROW_H : emptyH;
+    let includeTitleY = 0;
+    let ignoreTitleY = 0;
+    let includeTop = 0;
+    let ignoreTop = 0;
+    let addInclude: Rect = { x: 0, y: 0, w: 0, h: 0 };
+    let addIgnore: Rect = { x: 0, y: 0, w: 0, h: 0 };
 
-    cursor += secGap;
-    const ignoreTitleY = cursor + secTitleH / 2;
-    cursor += secTitleH;
-    const ignoreTop = cursor + DIALOG_ROW_H / 2;
-    const ignoreShown = Math.min(dialog.ignore.length, DIALOG_MAX_WORDS);
-    for (let i = 0; i < ignoreShown; i++) {
-      rows.push({ kind: 'ignore', index: i, word: dialog.ignore[i], y: ignoreTop + i * DIALOG_ROW_H });
-    }
-    cursor += dialog.ignore.length ? rowCount(dialog.ignore.length) * DIALOG_ROW_H : emptyH;
+    let cursor = y + titleH + DIALOG_TAB_H;
 
-    cursor += secGap;
-    const btnW = Math.floor((w - 12 * 2 - 8) / 2);
-    const addInclude: Rect = { x: x + 12, y: cursor, w: btnW, h: btnH };
-    const addIgnore: Rect = { x: x + 12 + btnW + 8, y: cursor, w: btnW, h: btnH };
-    cursor += btnH;
+    if (dialog.tab === 'words') {
+      includeTitleY = cursor + secTitleH / 2;
+      cursor += secTitleH;
+      includeTop = cursor + DIALOG_ROW_H / 2;
+      const includeShown = Math.min(dialog.include.length, DIALOG_MAX_WORDS);
+      for (let i = 0; i < includeShown; i++) {
+        rows.push({ kind: 'include', index: i, word: dialog.include[i], y: includeTop + i * DIALOG_ROW_H });
+      }
+      cursor += dialog.include.length ? rowCount(dialog.include.length) * DIALOG_ROW_H : emptyH;
+
+      cursor += secGap;
+      ignoreTitleY = cursor + secTitleH / 2;
+      cursor += secTitleH;
+      ignoreTop = cursor + DIALOG_ROW_H / 2;
+      const ignoreShown = Math.min(dialog.ignore.length, DIALOG_MAX_WORDS);
+      for (let i = 0; i < ignoreShown; i++) {
+        rows.push({ kind: 'ignore', index: i, word: dialog.ignore[i], y: ignoreTop + i * DIALOG_ROW_H });
+      }
+      cursor += dialog.ignore.length ? rowCount(dialog.ignore.length) * DIALOG_ROW_H : emptyH;
+
+      cursor += secGap;
+      const btnW = Math.floor((w - 12 * 2 - 8) / 2);
+      addInclude = { x: x + 12, y: cursor, w: btnW, h: btnH };
+      addIgnore = { x: x + 12 + btnW + 8, y: cursor, w: btnW, h: btnH };
+      cursor += btnH;
+    } else {
+      cursor += 3;
+      for (let i = 0; i < settingRows.length; i++) {
+        const rowY = cursor + DIALOG_SETTING_H / 2 + i * DIALOG_SETTING_H;
+        settings.push({
+          key: settingRows[i].key,
+          label: settingRows[i].label,
+          value: settingValueText(settingRows[i].key, this.settings),
+          y: rowY,
+          rect: { x: x + 10, y: rowY - DIALOG_SETTING_H / 2 + 2, w: w - 20, h: DIALOG_SETTING_H - 4 },
+        });
+      }
+      cursor += settingRows.length * DIALOG_SETTING_H;
+    }
+
     const tipY = cursor + 12;
+    return { box, close, tabs, settings, addInclude, addIgnore, includeTitleY, ignoreTitleY, includeTop, ignoreTop, rows, tipY };
+  }
 
-    return { box, close, addInclude, addIgnore, includeTitleY, ignoreTitleY, includeTop, ignoreTop, rows, tipY };
+  /** 每个分页底部的一句说明 */
+  private dialogHint(tab: DialogTab): string {
+    if (tab === 'words') return '排除词会存本地；筛选只影响显示';
+    if (tab === 'capacity') return '调小内存上限会立即丢掉最旧的日志';
+    return '点一行切换取值，设置会存本地';
   }
 
   private handleDialogTouch(x: number, y: number): void {
-    const dialog = this.filterDialog;
+    const dialog = this.settingsDialog;
     if (!dialog) return;
     const geo = this.getDialogLayout(dialog);
 
     if (!insideRect(geo.box, x, y) || insideRect(geo.close, x, y)) {
-      this.closeFilterDialog();
+      this.closeSettingsDialog();
       return;
     }
+
+    // 切换分页
+    for (let i = 0; i < geo.tabs.length; i++) {
+      if (insideRect(geo.tabs[i].rect, x, y)) {
+        if (dialog.tab !== geo.tabs[i].tab) {
+          dialog.tab = geo.tabs[i].tab;
+          this.invalidate();
+        }
+        return;
+      }
+    }
+
+    // 点设置项：整行都是命中区，点一下切到下一个取值
+    for (let i = 0; i < geo.settings.length; i++) {
+      if (insideRect(geo.settings[i].rect, x, y)) {
+        this.cycleSetting(geo.settings[i].key);
+        return;
+      }
+    }
+
+    if (dialog.tab !== 'words') return;
+
     if (insideRect(geo.addInclude, x, y)) {
       this.promptAddKeyword('include');
       return;
@@ -819,8 +1051,8 @@ export class LogPanelView {
     }
   }
 
-  private renderFilterDialog(): void {
-    const dialog = this.filterDialog;
+  private renderSettingsDialog(): void {
+    const dialog = this.settingsDialog;
     const ctx = this.ctx;
     if (!dialog || !ctx) return;
 
@@ -841,9 +1073,58 @@ export class LogPanelView {
     ctx.textAlign = 'left';
     ctx.font = FONT_BOLD;
     ctx.fillStyle = COLORS.title;
-    ctx.fillText('日志筛选', left, geo.box.y + 20);
+    ctx.fillText('面板设置', left, geo.box.y + 20);
     this.renderFlatButton(geo.close, '×', '#e0e0e0', 16);
 
+    // 标题下面那排分页
+    for (let i = 0; i < geo.tabs.length; i++) {
+      const tab = geo.tabs[i];
+      const active = tab.tab === dialog.tab;
+      roundRectPath(ctx, tab.rect.x, tab.rect.y, tab.rect.w, tab.rect.h, 6);
+      ctx.fillStyle = active ? COLORS.chipActiveBg : COLORS.chipBg;
+      ctx.fill();
+      ctx.textAlign = 'center';
+      ctx.font = FONT_SMALL;
+      ctx.fillStyle = active ? COLORS.chipActiveText : COLORS.dim;
+      ctx.fillText(tab.label, tab.rect.x + tab.rect.w / 2, tab.rect.y + tab.rect.h / 2);
+    }
+
+    if (dialog.tab === 'words') {
+      this.renderDialogWords(dialog, geo, left);
+    } else {
+      for (let i = 0; i < geo.settings.length; i++) {
+        const row = geo.settings[i];
+        const rect = row.rect;
+        roundRectPath(ctx, rect.x, rect.y, rect.w, rect.h, 5);
+        ctx.fillStyle = COLORS.cardBg;
+        ctx.fill();
+
+        ctx.textAlign = 'left';
+        ctx.font = FONT;
+        ctx.fillStyle = COLORS.text;
+        ctx.fillText(row.label, rect.x + 8, row.y);
+
+        const valueW = Math.min(DIALOG_VALUE_W, rect.w - 90);
+        const valueX = rect.x + rect.w - valueW - 6;
+        roundRectPath(ctx, valueX, rect.y + 3, valueW, rect.h - 6, 5);
+        ctx.fillStyle = COLORS.chipBg;
+        ctx.fill();
+        ctx.textAlign = 'center';
+        ctx.font = FONT_SMALL;
+        ctx.fillStyle = COLORS.title;
+        ctx.fillText(row.value, valueX + valueW / 2, row.y);
+      }
+    }
+
+    ctx.textAlign = 'left';
+    ctx.font = FONT_SMALL;
+    ctx.fillStyle = this.dialogTip ? COLORS.warn : COLORS.dim;
+    ctx.fillText(this.dialogTip || this.dialogHint(dialog.tab), left, geo.tipY);
+  }
+
+  /** 词表分页：两段关键词，各自可增删 */
+  private renderDialogWords(dialog: SettingsDialogState, geo: DialogLayout, left: number): void {
+    const ctx = this.ctx;
     const sections = [
       {
         title: '筛选（只显示命中）',
@@ -884,6 +1165,7 @@ export class LogPanelView {
         ctx.fill();
 
         ctx.textAlign = 'left';
+        ctx.font = FONT;
         ctx.fillStyle = sec.color;
         ctx.fillText(this.ellipsis(sec.words[i], geo.box.w - 24 - 32), left + 8, rowY);
 
@@ -906,11 +1188,6 @@ export class LogPanelView {
 
     this.renderFlatButton(geo.addInclude, '+ 筛选词', COLORS.info);
     this.renderFlatButton(geo.addIgnore, '+ 排除词', COLORS.error);
-
-    ctx.textAlign = 'left';
-    ctx.font = FONT_SMALL;
-    ctx.fillStyle = this.dialogTip ? COLORS.warn : COLORS.dim;
-    ctx.fillText(this.dialogTip || '排除词会存本地；筛选只影响显示', left, geo.tipY);
   }
 
   private hitButton(x: number, y: number): boolean {
@@ -971,7 +1248,7 @@ export class LogPanelView {
 
     const close: Rect = { x: panel.x + panel.w - 8 - 30, y: panel.y + 6, w: 30, h: 28 };
     const clear: Rect = { x: close.x - 8 - 48, y: panel.y + 8, w: 48, h: 24 };
-    // 「筛选」放在「清空」左边；窄屏时先保证标题区还剩 90px
+    // 「设置」放在「清空」左边；窄屏时先保证标题区还剩 90px
     const filterW = Math.max(30, Math.min(46, clear.x - 6 - panel.x - 90));
     const filterBtn: Rect = { x: clear.x - 6 - filterW, y: panel.y + 8, w: filterW, h: 24 };
 
@@ -1055,7 +1332,7 @@ export class LogPanelView {
       ctx.fillText(this.versionLabel, layout.header.x + 12 + titleWidth + 8 + countWidth + 8, titleY + 1);
     }
 
-    this.renderFlatButton(layout.filterBtn, '筛选', '#9ecbff');
+    this.renderFlatButton(layout.filterBtn, '设置', '#9ecbff');
     this.renderFlatButton(layout.clear, '清空', '#e0e0e0');
     this.renderFlatButton(layout.close, '×', '#e0e0e0', 16);
 
@@ -1169,7 +1446,7 @@ export class LogPanelView {
       this.throttleTimer = null;
     }
     this.clearDialogTipTimer();
-    this.filterDialog = null;
+    this.settingsDialog = null;
     if (this.netStateTimer) {
       try {
         this.netStateTimer();
@@ -1224,6 +1501,12 @@ export class LogPanelView {
       ctx.restore();
       return;
     }
+
+    // 「跟随最新」关掉时，新日志进来要把同样的位移补给 scroll，画面才不会自己往上跑
+    if (!followTail && this.lastContentHeight > 0 && cache.contentHeight > this.lastContentHeight && this.scroll > 0) {
+      this.scroll += cache.contentHeight - this.lastContentHeight;
+    }
+    this.lastContentHeight = cache.contentHeight;
 
     this.maxScroll = Math.max(0, cache.contentHeight - listRect.h);
     this.scroll = clamp(this.scroll, 0, this.maxScroll);
@@ -1304,14 +1587,14 @@ export class LogPanelView {
       filtered.push(entry);
       if (entry.runs) {
         const runLines = this.layoutRuns(entry, maxWidth, expanded);
-        const canExpand = expanded ? runLines.length > COLLAPSED_LINES : !!entry.runWrapCache?.more;
+        const canExpand = expanded ? runLines.length > visibleLines(false) : !!entry.runWrapCache?.more;
         runs.push(runLines);
         lines.push([]);
         heights.push(runLines.length * LINE_HEIGHT + ROW_GAP + (canExpand ? EXPAND_HINT_H : 0));
         expandable.push(canExpand);
       } else {
         const wrapped = this.wrapEntry(entry, maxWidth, expanded);
-        const canExpand = expanded ? wrapped.length > COLLAPSED_LINES : !!entry.wrapCache?.more;
+        const canExpand = expanded ? wrapped.length > visibleLines(false) : !!entry.wrapCache?.more;
         lines.push(wrapped);
         runs.push([]);
         heights.push(wrapped.length * LINE_HEIGHT + ROW_GAP + (canExpand ? EXPAND_HINT_H : 0));
@@ -1716,7 +1999,7 @@ export class LogPanelView {
     if (cache && cache.width === maxWidth && !!cache.expanded === expanded) return cache.lines as RunLine[];
 
     // 收起时多算一行用于判断「是否还有更多」
-    const limit = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES + 1;
+    const limit = expanded ? MAX_LINES_PER_ENTRY : visibleLines(false) + 1;
     const ctx = this.ctx;
     const runs = entry.runs || [];
     const lines: RunLine[] = [{ pieces: [] }];
@@ -1772,7 +2055,7 @@ export class LogPanelView {
       }
     };
 
-    feed('[' + entry.time + '] ', undefined);
+    if (showTime) feed('[' + entry.time + '] ', undefined);
     for (let i = 0; i < runs.length; i++) feed(runs[i].text, runs[i].style);
     closePiece();
 
@@ -1780,7 +2063,7 @@ export class LogPanelView {
     ctx.font = FONT;
 
     // 超出可见行数就截断，并在最后一行补一个省略号片段
-    const visible = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES;
+    const visible = visibleLines(expanded);
     const more = lines.length > visible;
     if (more) {
       lines.length = visible;
@@ -1800,9 +2083,9 @@ export class LogPanelView {
     if (cache && cache.width === maxWidth && !!cache.expanded === expanded) return cache.lines;
 
     // 收起时只要判断「是否还有更多」，多量一行就够，不必量满 40 行
-    const limit = expanded ? MAX_LINES_PER_ENTRY : COLLAPSED_LINES + 1;
+    const limit = expanded ? MAX_LINES_PER_ENTRY : visibleLines(false) + 1;
     const ctx = this.ctx;
-    const content = '[' + entry.time + '] ' + entry.text;
+    const content = (showTime ? '[' + entry.time + '] ' : '') + entry.text;
     const lines: string[] = [];
     const paragraphs = content.split('\n');
     let more = false;
@@ -1842,9 +2125,10 @@ export class LogPanelView {
     }
 
     if (!expanded) {
-      if (more) {
-        lines.length = COLLAPSED_LINES;
-        lines[COLLAPSED_LINES - 1] = lines[COLLAPSED_LINES - 1] + ' …';
+      const visible = visibleLines(false);
+      if (more && lines.length > visible) {
+        lines.length = visible;
+        lines[visible - 1] = lines[visible - 1] + ' …';
       }
     } else if (lines.length >= MAX_LINES_PER_ENTRY) {
       lines.length = MAX_LINES_PER_ENTRY;

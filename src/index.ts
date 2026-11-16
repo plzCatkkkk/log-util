@@ -24,6 +24,8 @@ import { createPresenter } from './presenter';
 import type { Presenter } from './presenter';
 import { interceptNetwork, NetStore } from './network';
 import type { NetRecord, NetworkPatch } from './network';
+import { DEFAULT_SETTINGS, loadSettings, saveSettings } from './settings';
+import type { PanelSettings } from './settings';
 
 export interface LogPanelOptions {
   /** 内存里最多保留多少条日志，超出丢弃最旧的，默认 1000 */
@@ -102,12 +104,6 @@ export interface LogPanelApi {
 /** 等待宿主上屏 canvas 的最长时间：超过就认为没有引擎占位，自己直接建 canvas */
 const HOST_WAIT_TIMEOUT = 1000;
 const HOST_POLL_INTERVAL = 50;
-/** 面板画布默认的像素比上限，见 LogPanelOptions.maxPixelRatio */
-const DEFAULT_MAX_PIXEL_RATIO = 2;
-/** 内存里保留的日志条数，memory 里存得多一些，方便用筛选词往回翻 */
-const DEFAULT_MAX_LOGS = 1000;
-/** 面板一次最多渲染多少条 */
-const DEFAULT_DISPLAY_LIMIT = 300;
 /** 排除词存在本地存储里的 key，重启后自动读回来 */
 const IGNORE_STORAGE_KEY = '__LOG_PANEL_IGNORE_KEYWORDS__';
 
@@ -150,6 +146,49 @@ let offNetChange: (() => void) | null = null;
 let started = false;
 let attachTimer: any = null;
 let pendingOptions: LogPanelOptions = {};
+/** 当前生效的设置：本地存过就整体以本地为准，否则用 init 选项覆盖默认值 */
+let settings: PanelSettings = { ...DEFAULT_SETTINGS };
+/** 面板画布，像素比改动后要按新尺寸重建 */
+let panelCanvas: any = null;
+
+/** 首次启动时的设置来源：本地记录优先，没有记录才用 init 里的容量/像素比配置 */
+function resolveSettings(opts: LogPanelOptions): PanelSettings {
+  const saved = loadSettings();
+  if (saved) return saved;
+  const base: PanelSettings = { ...DEFAULT_SETTINGS };
+  if (opts.maxLogs && opts.maxLogs > 0) base.maxLogs = Math.floor(opts.maxLogs);
+  if (opts.displayLimit && opts.displayLimit > 0) base.displayLimit = Math.floor(opts.displayLimit);
+  if (opts.maxNetRecords && opts.maxNetRecords > 0) base.maxNetRecords = Math.floor(opts.maxNetRecords);
+  if (opts.maxPixelRatio !== undefined && opts.maxPixelRatio >= 0) base.maxPixelRatio = opts.maxPixelRatio;
+  return base;
+}
+
+/**
+ * 设置变化后真正落地：容量类作用到仓库，像素比变化要按新尺寸重建画布。
+ * 显示类（字号 / 折叠行数 / 时间戳 / 跟随最新）由 ui 自己应用。
+ */
+function applySettings(next: PanelSettings): void {
+  const pixelRatioChanged = next.maxPixelRatio !== settings.maxPixelRatio;
+  settings = next;
+  if (store) {
+    store.setMaxLogs(next.maxLogs);
+    store.setDisplayLimit(next.displayLimit);
+  }
+  if (netStore) netStore.setMaxRecords(next.maxNetRecords);
+  if (pixelRatioChanged && panelCanvas) {
+    const size = getScreenSize(next.maxPixelRatio);
+    if (presenter) presenter.resize(panelCanvas, size);
+    if (view) view.resize(size);
+  }
+}
+
+/** 运行时通过 API 改容量类设置：落盘 + 落到仓库，面板设置弹窗里的取值也跟着变 */
+function updateSettings(patch: Partial<PanelSettings>): void {
+  const next: PanelSettings = { ...settings, ...patch };
+  saveSettings(next);
+  if (view) view.syncSettings(next);
+  else applySettings(next);
+}
 
 function mergeOptions(target: LogPanelOptions, source: LogPanelOptions): LogPanelOptions {
   const merged: LogPanelOptions = { ...target };
@@ -176,9 +215,10 @@ function startIntercept(): void {
   started = true;
 
   const opts = pendingOptions;
-  const logs = new LogStore(opts.maxLogs && opts.maxLogs > 0 ? opts.maxLogs : DEFAULT_MAX_LOGS);
-  logs.displayLimit = opts.displayLimit && opts.displayLimit > 0 ? Math.floor(opts.displayLimit) : DEFAULT_DISPLAY_LIMIT;
-  const net = new NetStore(opts.maxNetRecords && opts.maxNetRecords > 0 ? opts.maxNetRecords : 100);
+  settings = resolveSettings(opts);
+  const logs = new LogStore(settings.maxLogs);
+  logs.displayLimit = settings.displayLimit;
+  const net = new NetStore(settings.maxNetRecords);
   // 本地存的排除词优先恢复，这样引擎启动阶段最早的日志就能被过滤掉；
   // 代码里配置的排除词每次都重新叠加，不会被本地记录冲掉
   const savedKeywords = loadIgnoreKeywords();
@@ -220,8 +260,9 @@ function attachView(): void {
     logs.push('error', '[log-panel] 创建 canvas 失败，无法显示日志面板');
     return;
   }
+  panelCanvas = canvas;
 
-  const size = getScreenSize(opts.maxPixelRatio === undefined ? DEFAULT_MAX_PIXEL_RATIO : opts.maxPixelRatio);
+  const size = getScreenSize(settings.maxPixelRatio);
   resizeCanvas(canvas, size);
 
   // 小游戏里第一个 canvas 通常被引擎占用，这里建一条“离屏 2D → 屏幕”的通道
@@ -234,6 +275,8 @@ function attachView(): void {
     buttonPosition: opts.buttonPosition,
     onFrame: screen ? () => screen.present(canvas) : undefined,
     onOpenChange: screen ? (open) => screen.setBlocking(open) : undefined,
+    settings,
+    onSettingsChange: applySettings,
   });
   view = panelView;
 
@@ -248,7 +291,7 @@ function attachView(): void {
   offNetChange = net.onChange(() => panelView.onNetChange());
   unbindTouch = bindTouch(canvas, (x, y, phase) => panelView.handleTouch(x, y, phase));
   unbindResize = bindResize(() => {
-    const next = getScreenSize(opts.maxPixelRatio === undefined ? DEFAULT_MAX_PIXEL_RATIO : opts.maxPixelRatio);
+    const next = getScreenSize(settings.maxPixelRatio);
     if (screen) screen.resize(canvas, next);
     panelView.resize(next);
   });
@@ -318,9 +361,29 @@ function init(options?: LogPanelOptions): LogPanelApi {
     startIntercept();
   } else if (store) {
     // 已经自动初始化过，这里只补充配置
-    if (opts.maxLogs && opts.maxLogs > 0) store.setMaxLogs(opts.maxLogs);
-    if (opts.displayLimit && opts.displayLimit > 0) store.setDisplayLimit(opts.displayLimit);
-    if (opts.maxNetRecords && opts.maxNetRecords > 0 && netStore) netStore.setMaxRecords(opts.maxNetRecords);
+    const next = { ...settings };
+    let capacityChanged = false;
+    if (opts.maxLogs && opts.maxLogs > 0 && Math.floor(opts.maxLogs) !== next.maxLogs) {
+      next.maxLogs = Math.floor(opts.maxLogs);
+      capacityChanged = true;
+    }
+    if (opts.displayLimit && opts.displayLimit > 0 && Math.floor(opts.displayLimit) !== next.displayLimit) {
+      next.displayLimit = Math.floor(opts.displayLimit);
+      capacityChanged = true;
+    }
+    if (opts.maxNetRecords && opts.maxNetRecords > 0 && Math.floor(opts.maxNetRecords) !== next.maxNetRecords) {
+      next.maxNetRecords = Math.floor(opts.maxNetRecords);
+      capacityChanged = true;
+    }
+    if (opts.maxPixelRatio !== undefined && opts.maxPixelRatio >= 0 && opts.maxPixelRatio !== next.maxPixelRatio) {
+      next.maxPixelRatio = opts.maxPixelRatio;
+      capacityChanged = true;
+    }
+    if (capacityChanged) {
+      // 跟面板里改设置一样落盘，避免下次启动又回到旧值
+      saveSettings(next);
+      applySettings(next);
+    }
     if (opts.ignoreKeywords && opts.ignoreKeywords.length) store.addIgnoreKeywords(opts.ignoreKeywords);
     if (opts.includeKeywords && opts.includeKeywords.length) store.addIncludeKeywords(opts.includeKeywords);
   }
@@ -373,6 +436,7 @@ function destroy(): void {
   }
   store = null;
   netStore = null;
+  panelCanvas = null;
   started = false;
 }
 
@@ -399,13 +463,16 @@ const api: LogPanelApi = {
     return netStore ? netStore.list().slice() : [];
   },
   setMaxLogs(maxLogs: number) {
-    if (store) store.setMaxLogs(maxLogs);
+    if (!(maxLogs > 0)) return;
+    updateSettings({ maxLogs: Math.floor(maxLogs) });
   },
   setDisplayLimit(limit: number) {
-    if (store) store.setDisplayLimit(limit);
+    if (!(limit > 0)) return;
+    updateSettings({ displayLimit: Math.floor(limit) });
   },
   setMaxNetRecords(maxRecords: number) {
-    if (netStore) netStore.setMaxRecords(maxRecords);
+    if (!(maxRecords > 0)) return;
+    updateSettings({ maxNetRecords: Math.floor(maxRecords) });
   },
   addIgnoreKeywords(words: string[]) {
     if (store) store.addIgnoreKeywords(words || []);
