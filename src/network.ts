@@ -5,7 +5,7 @@
  * 每条请求在发起时先落一条 pending 记录（面板可实时看到进行中），
  * 拿到 success / fail 后再就地补全状态码、耗时、响应头和响应体。
  */
-import { formatArgs, stringifyLimited } from './console';
+import { formatArgs, stringifyLimited, trimMiddle } from './console';
 import type { LogStore } from './console';
 
 export interface NetworkPatch {
@@ -40,8 +40,24 @@ export interface NetRecord {
 
 export type NetStoreListener = () => void;
 
-/** query 里这些参数的值需要脱敏，避免 token 直接显示在面板上 */
-const SENSITIVE_KEY = /^(token|access_token|refresh_token|id_token|key|appkey|app_key|secret|sign|signature|password|passwd|pwd|session|sessionid|session_id|auth|authorization|cookie|ticket)$/i;
+/**
+ * 这些参数名 / 头部名 / body 字段名需要脱敏，避免 token 直接显示在面板上。
+ * 比较前会先归一化（转小写、去掉 - _ 空格），所以 accessToken / access-token / ACCESS_TOKEN 都能命中。
+ */
+const SENSITIVE_NAMES = [
+  'token', 'accesstoken', 'refreshtoken', 'idtoken', 'key', 'appkey', 'secret', 'sign',
+  'signature', 'password', 'passwd', 'pwd', 'session', 'sessionid', 'auth', 'authorization',
+  'cookie', 'setcookie', 'ticket', 'credential', 'credentials', 'privatekey', 'sessionkey',
+];
+
+/** 组合名兜底：xxxToken / xxxSecret / xxxPassword / xxxSignature 这类也按敏感处理 */
+const SENSITIVE_SUFFIX = /(token|secret|password|passwd|apikey|appkey|privatekey|signature|ticket)$/;
+
+function isSensitiveName(name: string): boolean {
+  const normalized = name.toLowerCase().replace(/[-_\s]/g, '');
+  if (!normalized) return false;
+  return SENSITIVE_NAMES.indexOf(normalized) >= 0 || SENSITIVE_SUFFIX.test(normalized);
+}
 
 /** 详情里的 body / 单个头值最多保留多少字符，避免一条记录吃爆内存 */
 const DETAIL_LIMIT = 2000;
@@ -69,8 +85,7 @@ function timestamp(): string {
 }
 
 function truncate(text: string, limit: number): string {
-  if (text.length <= limit) return text;
-  return text.slice(0, limit) + '\n…（已截断，共 ' + text.length + ' 字符）';
+  return trimMiddle(text, limit);
 }
 
 /** 把 url 里敏感参数的值替换成 ***，解析失败时原样返回 */
@@ -91,22 +106,55 @@ export function sanitizeUrl(url: string): string {
     } catch (e) {
       // 非法编码就按原文匹配
     }
-    if (SENSITIVE_KEY.test(name)) {
+    if (isSensitiveName(name)) {
       params[i] = param.slice(0, eq + 1) + '***';
     }
   }
   return head + '?' + params.join('&');
 }
 
+/** body 里敏感字段的掩码预算，避免在超大对象上递归过深 */
+const MASK_MAX_DEPTH = 6;
+const MASK_MAX_NODES = 300;
+
+/**
+ * 把对象里敏感字段的值就地换成 ***。
+ * 只处理 JSON 结构（对象 / 数组），纯文本 body 无法可靠识别，仍按原样展示。
+ */
+function maskSensitiveFields(value: any, depth: number, state: { nodes: number }): any {
+  if (!value || typeof value !== 'object') return value;
+  if (depth > MASK_MAX_DEPTH || state.nodes++ > MASK_MAX_NODES) return value;
+
+  const isArray = Object.prototype.toString.call(value) === '[object Array]';
+  const keys = Object.keys(value);
+  const result: any = isArray ? [] : {};
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const item = value[key];
+    if (isSensitiveName(key) && (typeof item === 'string' || typeof item === 'number')) {
+      result[key] = '***';
+    } else {
+      result[key] = maskSensitiveFields(item, depth + 1, state);
+    }
+  }
+  return result;
+}
+
 /** 请求体 / 响应体：对象按两空格缩进展开，方便直接读 */
 function formatBody(value: any): string {
   if (value === undefined || value === null) return '';
-  if (typeof value === 'string') return truncate(value.replace(/\r\n/g, '\n'), DETAIL_LIMIT);
+  if (typeof value === 'string') {
+    // 纯文本 body 无法可靠识别字段，只做长度裁剪
+    return truncate(value.replace(/\r\n/g, '\n'), DETAIL_LIMIT);
+  }
+
+  // 先按敏感字段名掩码，再按预算裁剪
+  const masked = maskSensitiveFields(value, 0, { nodes: 0 });
 
   // 序列化阶段就按预算裁剪，避免先落地一个完整的大字符串；
   // 超长的单个值就地省略，整体 JSON 结构保持完整
   try {
-    const text = stringifyLimited(value, DETAIL_LIMIT, 2, {
+    const text = stringifyLimited(masked, DETAIL_LIMIT, 2, {
       maxStringLength: BODY_STRING_LIMIT,
       maxArrayItems: BODY_ARRAY_ITEMS,
       maxKeys: BODY_MAX_KEYS,
@@ -117,13 +165,13 @@ function formatBody(value: any): string {
     // 落到下面的兜底
   }
   try {
-    return formatArgs([value]);
+    return formatArgs([masked]);
   } catch (e) {
     return truncate(String(value), DETAIL_LIMIT);
   }
 }
 
-/** 请求头 / 响应头：一行一个，值过长截断，条数也有上限 */
+/** 请求头 / 响应头：一行一个，敏感头值整体遮蔽，值过长截断，条数也有上限 */
 function formatHeaders(headers: any): string {
   if (!headers || typeof headers !== 'object') return '';
   const keys = Object.keys(headers);
@@ -132,7 +180,8 @@ function formatHeaders(headers: any): string {
   const count = Math.min(keys.length, MAX_HEADERS);
   for (let i = 0; i < count; i++) {
     const key = keys[i];
-    lines.push(key + ': ' + truncate(String(headers[key]), HEADER_VALUE_LIMIT));
+    const value = isSensitiveName(key) ? '***' : truncate(String(headers[key]), HEADER_VALUE_LIMIT);
+    lines.push(key + ': ' + value);
   }
   if (keys.length > count) lines.push('…（还有 ' + (keys.length - count) + ' 个头部未显示）');
   return lines.join('\n');

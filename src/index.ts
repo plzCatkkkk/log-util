@@ -16,7 +16,7 @@
  * 想关掉自动初始化，请在加载本文件之前设置：
  *   globalThis.__LOG_PANEL_AUTO_INIT__ = false
  */
-import { bindResize, bindTouch, createOverlayCanvas, getMyApi, getScreenSize, readStorage, resizeCanvas, writeStorage } from './env';
+import { bindResize, bindTouch, createOverlayCanvas, detachOverlayCanvas, getMyApi, getScreenSize, readStorage, resizeCanvas, writeStorage } from './env';
 import { LogStore, interceptConsole } from './console';
 import type { ConsolePatch } from './console';
 import { LogPanelView } from './ui';
@@ -150,6 +150,8 @@ let pendingOptions: LogPanelOptions = {};
 let settings: PanelSettings = { ...DEFAULT_SETTINGS };
 /** 面板画布，像素比改动后要按新尺寸重建 */
 let panelCanvas: any = null;
+/** 画布是不是自己建的：自己建的才需要在 destroy 时从 DOM 摘掉，宿主传进来的不能动 */
+let ownsCanvas = false;
 
 /** 首次启动时的设置来源：本地记录优先，没有记录才用 init 里的容量/像素比配置 */
 function resolveSettings(opts: LogPanelOptions): PanelSettings {
@@ -261,6 +263,7 @@ function attachView(): void {
     return;
   }
   panelCanvas = canvas;
+  ownsCanvas = !opts.canvas;
 
   const size = getScreenSize(settings.maxPixelRatio);
   resizeCanvas(canvas, size);
@@ -434,9 +437,12 @@ function destroy(): void {
     view.destroy();
     view = null;
   }
+  // 自己建的叠加画布要从 DOM 上摘掉，否则重复初始化会越叠越多
+  if (ownsCanvas) detachOverlayCanvas(panelCanvas);
+  panelCanvas = null;
+  ownsCanvas = false;
   store = null;
   netStore = null;
-  panelCanvas = null;
   started = false;
 }
 

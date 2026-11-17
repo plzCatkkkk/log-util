@@ -113,6 +113,21 @@ export function createOverlayCanvas(): any {
   return null;
 }
 
+/**
+ * 拆除自己建的叠加 canvas。
+ * 浏览器环境下 canvas 是挂在 DOM 上的，不摘掉的话 destroy 后还会残留在页面上，
+ * 再次初始化就变成两个叠在一起。小游戏里的 canvas 没有父节点，这里是空操作。
+ */
+export function detachOverlayCanvas(canvas: any): void {
+  if (!canvas) return;
+  try {
+    const parent = canvas.parentNode;
+    if (parent && typeof parent.removeChild === 'function') parent.removeChild(canvas);
+  } catch (e) {
+    // 已经被宿主移除就忽略
+  }
+}
+
 function readNumber(value: any): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : NaN;

@@ -96,12 +96,33 @@ function normalizeKeywords(words: string[]): string[] {
   return result;
 }
 
-/** 超出长度直接截断并标注原长度，省略提示也计入 limit，返回总长度不超过 limit */
-export function limitText(text: string, limit: number): string {
-  if (text.length <= limit) return text;
-  const marker = '…（已截断，共 ' + text.length + ' 字符）';
+/**
+ * 超长文本保留头尾两段，中间用省略标记占位。
+ * 只留头部会把报错、堆栈末行、JSON 结尾的括号一起丢掉，而这往往是最关键的信息；
+ * 尾部按三成预留，返回值总长度不超过 limit。
+ */
+export function trimMiddle(text: string, limit: number, tailRatio = 0.3): string {
+  const total = text.length;
+  if (total <= limit) return text;
+
+  let marker = '';
+  let head = 0;
+  let tail = 0;
+  // 标记里带省略数量，长度依赖 head / tail，迭代两轮即可收敛
+  for (let pass = 0; pass < 2; pass++) {
+    const keep = Math.max(0, limit - marker.length);
+    head = Math.ceil(keep * (1 - tailRatio));
+    tail = keep - head;
+    marker = '…（省略 ' + Math.max(0, total - head - tail) + ' / ' + total + ' 字符）…';
+  }
+
   if (marker.length >= limit) return text.slice(0, limit);
-  return text.slice(0, limit - marker.length) + marker;
+  return text.slice(0, head) + marker + (tail > 0 ? text.slice(total - tail) : '');
+}
+
+/** 超出长度保留头尾并标注省略数量，省略提示也计入 limit，返回总长度不超过 limit */
+export function limitText(text: string, limit: number): string {
+  return trimMiddle(text, limit);
 }
 
 /** 结构裁剪参数：超限时按值省略，尽量保住整体结构 */
@@ -127,9 +148,20 @@ const DEFAULT_STRINGIFY_OPTIONS: Required<StringifyOptions> = {
 };
 
 /**
+ * 把对象里的单个字符串值压短：保留头尾，中间标注原长度。
+ * 只留头部会把堆栈末行、JSON 结尾、URL 尾部参数一起丢掉。
+ */
+function abbreviateValue(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const head = Math.ceil(limit * 0.7);
+  const tail = limit - head;
+  return text.slice(0, head) + '…（共 ' + text.length + ' 字符）…' + (tail > 0 ? text.slice(text.length - tail) : '');
+}
+
+/**
  * 把值裁成一份“结构不变、内容缩水”的副本：
- * 超长字符串就地截断、超长数组切掉尾巴、层级过深折叠成占位符。
- * 这样最终 JSON 的前半部分结构完整，而不是从中间被砍断。
+ * 超长字符串就地缩写、超长数组切掉尾巴、层级过深折叠成占位符。
+ * 这样键名和层级都能保住，不会被从中间砍断。
  */
 function prepareForStringify(
   value: any,
@@ -140,10 +172,7 @@ function prepareForStringify(
 ): any {
   const type = typeof value;
 
-  if (type === 'string') {
-    if (value.length <= opts.maxStringLength) return value;
-    return value.slice(0, opts.maxStringLength) + '…（共 ' + value.length + ' 字符）';
-  }
+  if (type === 'string') return abbreviateValue(value, opts.maxStringLength);
   if (type === 'bigint') return String(value);
   if (type === 'function') return '[Function' + (value.name ? ': ' + value.name : '') + ']';
   if (!value || type !== 'object') return value;
@@ -193,27 +222,15 @@ function prepareForStringify(
   return result;
 }
 
-/**
- * 带预算的 JSON 序列化。
- * 节点数或字符数一旦超预算就用 '[…]' 顶掉剩余部分，
- * 避免先落地一个完整的大字符串再把内存峰值顶穿。
- * 传了 options 时先做结构裁剪：优先省略过长的单个值，保住整体结构。
- */
-export function stringifyLimited(value: any, limit: number, indent?: number, options?: StringifyOptions): string {
+/** 单值缩写的最小预算：再压下去就失去排查价值了 */
+const MIN_VALUE_CHARS = 32;
+
+/** 按预算序列化：字符串一超标就把后面的值换成占位符，避免内存峰值 */
+function serializeBudgeted(source: any, limit: number, indent?: number): string {
   const seen: any[] = [];
   let dedupe = true;
   let nodes = 0;
   let budget = limit;
-
-  let source = value;
-  if (options) {
-    const opts = { ...DEFAULT_STRINGIFY_OPTIONS, ...options } as Required<StringifyOptions>;
-    try {
-      source = prepareForStringify(value, opts, 0, [], { nodes: 0 });
-    } catch (e) {
-      source = value;
-    }
-  }
 
   const json = JSON.stringify(
     source,
@@ -238,7 +255,48 @@ export function stringifyLimited(value: any, limit: number, indent?: number, opt
     indent
   );
 
-  return limitText(json === undefined ? String(value) : json, limit);
+  return json === undefined ? String(source) : json;
+}
+
+/**
+ * 带预算的 JSON 序列化。
+ * 传了 options 时先做结构裁剪：键名、层级、数组项都保留，只把过长的单个值缩略；
+ * 裁剪后仍超长就继续收紧单值预算重排，最终结果始终是一份完整的对象结构。
+ */
+export function stringifyLimited(value: any, limit: number, indent?: number, options?: StringifyOptions): string {
+  let opts: Required<StringifyOptions> | null = null;
+  let source = value;
+  if (options) {
+    opts = { ...DEFAULT_STRINGIFY_OPTIONS, ...options } as Required<StringifyOptions>;
+    try {
+      source = prepareForStringify(value, opts, 0, [], { nodes: 0 });
+    } catch (e) {
+      source = value;
+      opts = null;
+    }
+  }
+
+  let json = serializeBudgeted(source, limit, indent);
+
+  // 结构裁剪后仍然超长：继续收紧「单个值」的预算重排，而不是把整串 JSON 从中间砍断。
+  // 键名、层级不参与压缩，所以最终结果始终是一份完整的对象结构。
+  for (let pass = 0; opts && json.length > limit && pass < 3; pass++) {
+    const shorter = Math.max(MIN_VALUE_CHARS, Math.floor(opts.maxStringLength / 4));
+    if (shorter === opts.maxStringLength) break;
+    opts = { ...opts, maxStringLength: shorter };
+
+    let retried: string;
+    try {
+      retried = serializeBudgeted(prepareForStringify(value, opts, 0, [], { nodes: 0 }), limit, indent);
+    } catch (e) {
+      break;
+    }
+    // 压不了了就停，避免白跑
+    if (retried.length >= json.length) break;
+    json = retried;
+  }
+
+  return limitText(json, limit);
 }
 
 function formatValue(value: any): string {
